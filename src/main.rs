@@ -3,9 +3,12 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use probsim::benford::{self, Source};
-use probsim::output::{benford_json, benford_report, outcome_json, report, summary, TextOptions};
+use probsim::output::{
+    benford_json, benford_report, explain_block, outcome_json, report, summary, TextOptions,
+};
 use probsim::paradox::{secretary_best_skip, Lang, Paradox};
-use probsim::sim::{simulate, Outcome};
+use probsim::rng::Rng;
+use probsim::sim::{derived_seed, simulate, Outcome};
 
 const HELP: &str = "\
 probsim: watch probability paradoxes converge, next to their exact answers.
@@ -22,13 +25,16 @@ Paradoxes:
                                                 --candidates N (100), --skip K (best)
   buffon       Buffon's needle, and pi          --length L (1), --spacing T (2), L <= T
   benford      Leading digits                   --source powers2|fibonacci (powers2),
-                                                --file PATH (your own numbers)
+                                                --file PATH (your own numbers),
+                                                --column N, --delimiter C (CSV)
 
 Options:
   --trials N     Trials to run, 1 to 100,000,000 (100,000); for benford, terms
-  --seed N       Seed for a repeatable run (random when omitted; always printed)
+  --explain N    Tell the first N trials step by step, 1 to 100 (same seed, same trials)
+  --seed N       Seed for a repeatable run, 0 to 9007199254740991 (random when
+                 omitted; always printed)
   --check        Exit 1 if an exact answer is outside the 99.9% interval
-                 (benford: p < 0.001)
+                 (benford: p < 0.001); exit 2 if there are too few trials to judge
   --json         JSON instead of text
   --no-chart     Leave out the convergence chart
   --width N      Chart width in columns, 10 to 200 (60)
@@ -37,12 +43,17 @@ Options:
   -V, --version  Version
 ";
 
-/// 99.9% two-sided, for --check: a correct simulation fails it about once in 1,000 runs.
+/// 99.9% two-sided, for --check: with enough trials, a correct simulation
+/// fails one check about once in 1,000 runs.
 const Z999: f64 = 3.290_526_731_491_926;
+
+/// The largest seed that survives a trip through JSON numbers (2^53 - 1).
+const MAX_SEED: u64 = (1 << 53) - 1;
 
 struct Args {
     command: String,
     trials: u64,
+    explain: u32,
     seed: Option<u64>,
     check: bool,
     json: bool,
@@ -60,6 +71,8 @@ struct Args {
     spacing: f64,
     source: Option<String>,
     file: Option<String>,
+    column: Option<usize>,
+    delimiter: Option<char>,
     /// Options given, to reject ones that do not apply to the command.
     given: Vec<String>,
 }
@@ -84,11 +97,22 @@ fn in_range<T: PartialOrd + std::fmt::Display>(
     }
 }
 
+/// Options that take no value.
+const SWITCHES: &[&str] = &[
+    "--check",
+    "--json",
+    "--no-chart",
+    "--random-host",
+    "--help",
+    "--version",
+];
+
 fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
     let mut it = argv.into_iter();
     let mut a = Args {
         command: String::new(),
         trials: 100_000,
+        explain: 0,
         seed: None,
         check: false,
         json: false,
@@ -106,6 +130,8 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
         spacing: 2.0,
         source: None,
         file: None,
+        column: None,
+        delimiter: None,
         given: Vec::new(),
     };
     while let Some(arg) = it.next() {
@@ -113,6 +139,9 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
             Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
             _ => (arg.clone(), None),
         };
+        if inline.is_some() && SWITCHES.contains(&flag.as_str()) {
+            return Err(format!("{flag} takes no value"));
+        }
         let mut val = || inline.clone().or_else(|| it.next());
         match flag.as_str() {
             "-h" | "--help" => {
@@ -124,7 +153,8 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "--trials" => a.trials = in_range(&flag, number(&flag, val())?, 1, 100_000_000)?,
-            "--seed" => a.seed = Some(number(&flag, val())?),
+            "--explain" => a.explain = in_range(&flag, number(&flag, val())?, 1, 100)?,
+            "--seed" => a.seed = Some(in_range(&flag, number(&flag, val())?, 0, MAX_SEED)?),
             "--check" => a.check = true,
             "--json" => a.json = true,
             "--no-chart" => a.chart = false,
@@ -148,6 +178,14 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
             "--spacing" => a.spacing = number(&flag, val())?,
             "--source" => a.source = Some(val().ok_or("--source needs a value")?),
             "--file" => a.file = Some(val().ok_or("--file needs a value")?),
+            "--column" => a.column = Some(in_range(&flag, number(&flag, val())?, 1, 10_000)?),
+            "--delimiter" => {
+                a.delimiter = Some(match val().as_deref() {
+                    Some("tab") | Some("\t") => '\t',
+                    Some(s) if s.chars().count() == 1 => s.chars().next().unwrap(),
+                    _ => return Err("--delimiter must be one character, or tab".into()),
+                })
+            }
             f if f.starts_with('-') => return Err(format!("unknown option {f:?}; see --help")),
             _ if a.command.is_empty() => {
                 a.command = arg;
@@ -165,24 +203,32 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
     Ok(Some(a))
 }
 
-/// Options only some commands take.
-fn applies(command: &str, flag: &str) -> bool {
-    let only: &[(&str, &[&str])] = &[
-        ("--doors", &["monty-hall"]),
-        ("--random-host", &["monty-hall"]),
-        ("--people", &["birthday"]),
-        ("--days", &["birthday"]),
-        ("--items", &["coupon", "gacha"]),
-        ("--candidates", &["secretary"]),
-        ("--skip", &["secretary"]),
-        ("--length", &["buffon"]),
-        ("--spacing", &["buffon"]),
-        ("--source", &["benford"]),
-        ("--file", &["benford"]),
+/// Whether an option means anything for a command.
+fn applies(a: &Args, flag: &str) -> bool {
+    let c = a.command.as_str();
+    let sims = [
+        "monty-hall",
+        "birthday",
+        "coupon",
+        "gacha",
+        "secretary",
+        "buffon",
     ];
-    only.iter()
-        .find(|(f, _)| *f == flag)
-        .is_none_or(|(_, cmds)| cmds.contains(&command))
+    match flag {
+        _ if c == "list" => false,
+        "--doors" | "--random-host" => c == "monty-hall",
+        "--people" | "--days" => c == "birthday",
+        "--items" => c == "coupon" || c == "gacha",
+        "--candidates" | "--skip" => c == "secretary",
+        "--length" | "--spacing" => c == "buffon",
+        "--source" | "--file" => c == "benford",
+        "--column" | "--delimiter" => c == "benford" && a.file.is_some(),
+        // A file has as many numbers as it has; --trials sets a sequence's length.
+        "--trials" => c != "benford" || a.file.is_none(),
+        "--explain" => sims.contains(&c),
+        "--no-chart" | "--width" => c != "all",
+        _ => true,
+    }
 }
 
 fn paradox(a: &Args, command: &str) -> Result<Paradox, String> {
@@ -217,7 +263,11 @@ fn paradox(a: &Args, command: &str) -> Result<Paradox, String> {
             if !ok(a.length) || !ok(a.spacing) {
                 return Err("--length and --spacing must be positive numbers".into());
             }
-            if a.length > a.spacing {
+            let r = a.length / a.spacing;
+            if !(r.is_finite() && r > 0.0) {
+                return Err("--length and --spacing are too far apart in size".into());
+            }
+            if r > 1.0 {
                 return Err(
                     "--length must not exceed --spacing (the formula is for a short needle)".into(),
                 );
@@ -236,10 +286,19 @@ fn source(a: &Args) -> Result<Source, String> {
         if a.source.as_deref().is_some_and(|s| s != "file") {
             return Err("--file reads your numbers; leave out --source".into());
         }
-        let text =
-            std::fs::read_to_string(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
-        let numbers = benford::numbers_in(&text);
-        return Ok(Source::File(path.clone(), numbers));
+        // Not necessarily UTF-8 (a Shift_JIS CSV, say): numbers are ASCII,
+        // so anything else is replaced and ignored.
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let scan = match a.column {
+            Some(c) => benford::scan_csv(&text, c, a.delimiter.unwrap_or(',')),
+            None => benford::scan_text(&text),
+        };
+        return Ok(Source::File {
+            name: path.clone(),
+            column: a.column,
+            scan,
+        });
     }
     match a.source.as_deref() {
         None | Some("powers2") => Ok(Source::PowersOfTwo(a.trials)),
@@ -272,17 +331,26 @@ const LIST: &[(&str, &str)] = &[
     ),
 ];
 
+/// Too few trials to judge, under --check.
+fn undecided(what: &str) -> String {
+    format!("--check cannot judge {what}: too few trials (an average needs at least 30; benford needs 110 numbers)")
+}
+
 fn run(a: Args) -> Result<ExitCode, String> {
     let lang = a
         .lang
         .unwrap_or_else(|| Lang::from_env(|k| std::env::var(k).ok()));
     let seed = a.seed.unwrap_or_else(|| {
-        SystemTime::now()
+        let t = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64 ^ std::process::id() as u64)
+            .map_or(0, |d| d.as_nanos() as u64);
+        derived_seed(t, std::process::id() as u64)
     });
-    if let Some(f) = a.given.iter().find(|f| !applies(&a.command, f)) {
-        return Err(format!("{f} does not apply to {:?}; see --help", a.command));
+    if let Some(f) = a.given.iter().find(|f| !applies(&a, f)) {
+        return Err(format!(
+            "{f} does not apply to {:?} here; see --help",
+            a.command
+        ));
     }
     let opt = TextOptions {
         lang,
@@ -291,21 +359,17 @@ fn run(a: Args) -> Result<ExitCode, String> {
     };
     let points = a.width.max(60);
     let mut out = std::io::stdout().lock();
-    let write = |out: &mut std::io::StdoutLock, s: &str| {
-        out.write_all(s.as_bytes()).map_err(|e| e.to_string())
-    };
-    let ok_outcome = |o: &Outcome| !a.check || o.consistent(Z999);
-    let ok_benford = |p: f64| !a.check || p >= 0.001;
+    let mut write = |s: &str| out.write_all(s.as_bytes()).map_err(|e| e.to_string());
     match a.command.as_str() {
         "list" => {
             for (name, about) in LIST {
-                write(&mut out, &format!("{name:<12} {about}\n"))?;
+                write(&format!("{name:<12} {about}\n"))?;
             }
             Ok(ExitCode::SUCCESS)
         }
         "benford" => {
             let src = source(&a)?;
-            let analysis = benford::analyze(&src.digits());
+            let analysis = benford::analyze(src.counts());
             if analysis.total == 0 {
                 return Err("no nonzero numbers found".into());
             }
@@ -314,27 +378,36 @@ fn run(a: Args) -> Result<ExitCode, String> {
             } else {
                 benford_report(&src, &analysis, &opt)
             };
-            write(&mut out, &text)?;
-            Ok(if ok_benford(analysis.p_value) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
+            write(&text)?;
+            if !a.check {
+                return Ok(ExitCode::SUCCESS);
+            }
+            match analysis.p_value {
+                Some(p) if p >= 0.001 => Ok(ExitCode::SUCCESS),
+                Some(_) => Ok(ExitCode::FAILURE),
+                None => Err(undecided("benford")),
+            }
         }
         "all" => {
             let commands = ["monty-hall", "birthday", "coupon", "secretary", "buffon"];
             let mut outcomes = Vec::new();
-            for c in commands {
-                outcomes.push(simulate(&paradox(&a, c)?, a.trials, seed, points));
+            for (i, c) in commands.iter().enumerate() {
+                // Each paradox gets its own random stream, derived from the seed.
+                outcomes.push(simulate(
+                    &paradox(&a, c)?,
+                    a.trials,
+                    derived_seed(seed, i as u64),
+                    points,
+                ));
             }
             let src = Source::PowersOfTwo(a.trials);
-            let analysis = benford::analyze(&src.digits());
+            let analysis = benford::analyze(src.counts());
             let text = if a.json {
                 format!(
                     "{{\"seed\":{seed},\"results\":[{}],\"benford\":{}}}\n",
                     outcomes
                         .iter()
-                        .map(outcome_json)
+                        .map(|o| outcome_json(o, &[]))
                         .collect::<Vec<_>>()
                         .join(","),
                     benford_json(&src, &analysis)
@@ -343,17 +416,30 @@ fn run(a: Args) -> Result<ExitCode, String> {
                 summary(&outcomes, Some((&src, &analysis)), lang)
                     + &match lang {
                         Lang::En => format!(
-                            "\n{} trials each, seed {seed}\n",
+                            "\n{} trials each, seed {seed} (each paradox gets its own stream from it; see --json)\n",
                             probsim::output::grouped(a.trials)
                         ),
                         Lang::Ja => format!(
-                            "\n各{}回、seed {seed}\n",
+                            "\n各{}回、seed {seed}(各パラドックスはここから導いた別々の乱数列。--jsonに各seedを出力)\n",
                             probsim::output::grouped(a.trials)
                         ),
                     }
             };
-            write(&mut out, &text)?;
-            let ok = outcomes.iter().all(ok_outcome) && ok_benford(analysis.p_value);
+            write(&text)?;
+            if !a.check {
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut ok = true;
+            for o in &outcomes {
+                match o.consistent(Z999) {
+                    Some(c) => ok &= c,
+                    None => return Err(undecided(o.paradox.name())),
+                }
+            }
+            match analysis.p_value {
+                Some(p) => ok &= p >= 0.001,
+                None => return Err(undecided("benford")),
+            }
             Ok(if ok {
                 ExitCode::SUCCESS
             } else {
@@ -362,21 +448,38 @@ fn run(a: Args) -> Result<ExitCode, String> {
         }
         c => {
             let p = paradox(&a, c)?;
-            let o = simulate(&p, a.trials, seed, points);
+            // --explain replays the first trials of the same seed with their
+            // stories; the simulation below repeats them and goes on.
+            let mut stories = Vec::new();
+            if a.explain > 0 {
+                let mut rng = Rng::new(seed);
+                let mut scratch = Vec::new();
+                for _ in 0..a.explain.min(a.trials.min(u32::MAX as u64) as u32) {
+                    stories.push(p.explain(&mut rng, &mut scratch, lang));
+                }
+            }
+            let o: Outcome = simulate(&p, a.trials, seed, points);
             if o.counted == 0 {
                 return Err("no trial counted; run more trials".into());
             }
             let text = if a.json {
-                outcome_json(&o) + "\n"
+                outcome_json(&o, &stories) + "\n"
             } else {
-                report(&o, &opt)
+                let mut t = report(&o, &opt);
+                if !stories.is_empty() {
+                    t = format!("{}\n{t}", explain_block(&p, &stories, lang));
+                }
+                t
             };
-            write(&mut out, &text)?;
-            Ok(if ok_outcome(&o) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
+            write(&text)?;
+            if !a.check {
+                return Ok(ExitCode::SUCCESS);
+            }
+            match o.consistent(Z999) {
+                Some(true) => Ok(ExitCode::SUCCESS),
+                Some(false) => Ok(ExitCode::FAILURE),
+                None => Err(undecided(c)),
+            }
         }
     }
 }

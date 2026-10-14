@@ -2,6 +2,7 @@
 name = "probsim"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 license = "MIT"
 description = "Watch probability paradoxes converge next to their exact answers: Monty Hall, the birthday paradox, gacha completion, the secretary problem, Buffon's needle and Benford's law (also on your own data). Zero-dependency Rust CLI."
 authors = ["printemps.tokyo <develop@printemps.tokyo>"]

@@ -31,28 +31,45 @@ impl Running {
 /// z for a two-sided 95% interval.
 pub const Z95: f64 = 1.959_963_984_540_054;
 
-/// Wilson score interval for a proportion: better than mean +- z*se near 0
-/// and 1 and for small n.
-pub fn wilson(successes: f64, n: u64) -> (f64, f64) {
+/// Wilson score interval for `successes` out of `n` at confidence z: better
+/// than p +- z*se near 0 and 1 and for small n. With no successes the lower
+/// bound is exactly 0, and with all successes the upper bound is exactly 1,
+/// so rounding never pushes a certain outcome out of its own interval.
+pub fn wilson(successes: u64, n: u64, z: f64) -> (f64, f64) {
     if n == 0 {
         return (0.0, 1.0);
     }
-    let n = n as f64;
-    let p = successes / n;
-    let z2 = Z95 * Z95;
-    let denom = 1.0 + z2 / n;
-    let center = (p + z2 / (2.0 * n)) / denom;
-    let half = Z95 * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / denom;
-    ((center - half).max(0.0), (center + half).min(1.0))
+    let nf = n as f64;
+    let p = successes as f64 / nf;
+    let z2 = z * z;
+    let denom = 1.0 + z2 / nf;
+    let center = (p + z2 / (2.0 * nf)) / denom;
+    let half = z * (p * (1.0 - p) / nf + z2 / (4.0 * nf * nf)).sqrt() / denom;
+    let lo = if successes == 0 {
+        0.0
+    } else {
+        (center - half).max(0.0)
+    };
+    let hi = if successes == n {
+        1.0
+    } else {
+        (center + half).min(1.0)
+    };
+    (lo, hi)
 }
 
-/// mean +- z * s / sqrt(n).
-pub fn normal_interval(r: &Running) -> (f64, f64) {
-    if r.n < 2 {
-        return (f64::NEG_INFINITY, f64::INFINITY);
+/// Below this many values, an interval for an average is not trusted: the
+/// normal approximation behind it is too rough (and with a handful of equal
+/// values the sample variance is 0).
+pub const MIN_FOR_MEAN: u64 = 30;
+
+/// mean +- z * s / sqrt(n), or None with fewer than `MIN_FOR_MEAN` values.
+pub fn normal_interval(r: &Running, z: f64) -> Option<(f64, f64)> {
+    if r.n < MIN_FOR_MEAN {
+        return None;
     }
-    let half = Z95 * (r.variance() / r.n as f64).sqrt();
-    (r.mean() - half, r.mean() + half)
+    let half = z * (r.variance() / r.n as f64).sqrt();
+    Some((r.mean() - half, r.mean() + half))
 }
 
 /// H_n = 1 + 1/2 + ... + 1/n.

@@ -23,29 +23,31 @@ you the one door left. Should you switch?
              he leaves closed.
 
 Convergence: switching wins, by number of games (log scale)
-  0.73211 |^
-          |
-          |
-          |
-          |
+  0.73211 |^                      .
+          |                        ..
+          |                          ...
+          |                             ....
+          |                                 ..........
   0.66667 |--------*------------*-------*----------**********
-          |                  *** *    ** **********
-          |                 *    *   *
-          |                 *     *
+          |                  *** *    ** **********...
+          |                 *    *   *  ....
+          |                 *     *  ...
           |               **       **
-  0.60122 |   v vvvvvvvvvv
+  0.60122 |   v vvvvvvvvvv        .
           +--------------------------------------------------
            1                      316                    100k
+  - exact answer   * this run   . where 95% of runs stay at each point
 ```
 
 Each paradox comes with the question, what intuition says, the exact answer
 and why, then a simulation with a 95% confidence interval and a chart of the
-running estimate settling onto the exact value. Explanations are in English
-or Japanese (`--lang ja`).
+running estimate settling onto the exact value, inside a funnel that narrows
+like 1/sqrt(n). `--explain N` tells the first trials step by step.
+Explanations are in English or Japanese (`--lang ja`).
 
 ## Install
 
-From source, with a Rust toolchain (https://rustup.rs):
+From source, with a Rust toolchain 1.82 or later (https://rustup.rs):
 
 ```bash
 cargo install --git https://github.com/printemps-tokyo/probsim
@@ -60,41 +62,55 @@ SHA-256 checksums. No dependencies beyond the Rust standard library.
 ```bash
 probsim list                             # the paradoxes
 probsim monty-hall                       # 100,000 games
+probsim monty-hall --explain 5           # the first 5 games, step by step
 probsim monty-hall --doors 10            # host opens 8 goat doors
 probsim monty-hall --random-host         # the careless host: now it is 1/2
 probsim birthday --people 40
 probsim coupon --items 50                # gacha: draws to collect 50 items
 probsim secretary --candidates 1000
 probsim buffon                           # estimate pi
-probsim benford --file sales.csv         # your own numbers
+probsim benford --file sales.csv --column 3   # your own numbers
 probsim all --check                      # every paradox, exit 1 if one is off
+```
+
+```console
+$ probsim monty-hall --random-host --explain 3 --trials 10 --seed 3
+The first 3 games, step by step:
+  Game 1: car behind door 3, you pick door 2; the host, opening doors at
+          random, leaves door 1 closed and reveals the car: this game does not
+          count
+  Game 2: car behind door 2, you pick door 2; the host leaves door 1 closed
+          and opens the other door; switching to door 1 loses
+  Game 3: car behind door 1, you pick door 3; the host, opening doors at
+...
 ```
 
 ```console
 $ probsim all --seed 7
 paradox            exact   simulated  95% CI
-monty-hall       0.66667     0.66566  [0.66273, 0.66858]      ok
-birthday         0.50730     0.50878  [0.50568, 0.51188]      ok
-coupon             29.29       29.27  [29.20, 29.34]          ok
-secretary        0.37104     0.36831  [0.36533, 0.37130]      ok
-buffon           0.31831     0.31768  [0.31480, 0.32057]      ok
+monty-hall       0.66667     0.66540  [0.66247, 0.66832]      ok
+birthday         0.50730     0.50798  [0.50488, 0.51108]      ok
+coupon             29.29       29.34  [29.27, 29.41]          ok
+secretary        0.37104     0.37214  [0.36915, 0.37514]      ok
+buffon           0.31831     0.31923  [0.31635, 0.32213]      ok
 benford                -     p=1.000  powers2 100,000         ok
 
-100,000 trials each, seed 7
+100,000 trials each, seed 7 (each paradox gets its own stream from it; see --json)
 ```
 
 | Option | Description | Default |
 | --- | --- | --- |
 | `--trials N` | Trials, 1 to 100,000,000; for `benford` sequences, the number of terms | `100000` |
-| `--seed N` | Seed for a repeatable run; always printed | random |
-| `--check` | Exit 1 if an exact answer is outside the 99.9% interval (benford: p < 0.001) | |
+| `--explain N` | Tell the first N trials step by step (1 to 100); they are the first trials of the run itself | |
+| `--seed N` | Seed for a repeatable run, 0 to 2^53 - 1 (so it survives JSON); always printed | random |
+| `--check` | Exit 1 if an exact answer is outside the 99.9% interval (benford: p < 0.001); exit 2 if there are too few trials to judge | |
 | `--json` | JSON instead of text | |
 | `--no-chart` | Leave out the convergence chart | |
 | `--width N` | Chart width in columns, 10 to 200 | `60` |
 | `--lang L` | `auto`, `ja` or `en`; `auto` reads `LC_ALL`, `LC_MESSAGES`, `LANG` | `auto` |
 
 Exit codes: 0 on success, 1 when `--check` finds a result off, 2 on a usage
-error.
+error or when `--check` cannot judge.
 
 ## The paradoxes
 
@@ -104,36 +120,57 @@ error.
 | `birthday` | How likely is a shared birthday? 50.7% for 23 people. | `--people N` (23), `--days N` (365) |
 | `coupon` (`gacha`) | Draws to collect every item: n x H_n on average, 29.3 for 10 items. | `--items N` (10) |
 | `secretary` | Hire the best candidate, deciding on the spot. Skip the first ~37%, then take the first who beats them all. | `--candidates N` (100), `--skip K` (the best cutoff) |
-| `buffon` | A needle of length l on lines t apart crosses with probability 2l/(pi t), so needles estimate pi. | `--length L` (1), `--spacing T` (2), L <= T |
-| `benford` | Digit d leads with probability log10(1 + 1/d): 30.1% for 1. | `--source powers2\|fibonacci`, `--file PATH` |
+| `buffon` | A needle of length l on lines t apart crosses with probability 2l/(pi t), so needles estimate pi. Only l/t matters. | `--length L` (1), `--spacing T` (2), L <= T |
+| `benford` | In data that follows Benford's law, digit d leads with probability log10(1 + 1/d): 30.1% for 1. | `--source powers2\|fibonacci`, `--file PATH`, `--column N`, `--delimiter C` |
 
 ### Benford's law on your own data
 
-`probsim benford --file data.csv` takes every number in a text file (CSV,
-TSV, logs, anything), counts the leading digits of the nonzero ones, and runs
-a chi-square test against Benford's law (8 degrees of freedom). Commas that
-group thousands (`1,234,567`) are read as part of the number; other commas
-separate numbers, so a CSV field like `1,234` is read as one thousand two
-hundred thirty-four. Benford's law fits data spanning several orders of
-magnitude (populations, prices, transaction amounts); data with a narrow range
-or assigned numbers (heights, IDs, phone numbers) is not expected to follow
-it, so a mismatch is not by itself a sign of anything wrong.
+`probsim benford --file data.csv` counts the leading digits of the numbers in
+a text file and runs a chi-square test against Benford's law (8 degrees of
+freedom).
+
+- `--column N` reads only column N (1-based) of a CSV file, with quoted
+  fields handled; `--delimiter` sets the separator (`,` by default, `tab` for
+  TSV). Use it for CSV files: without it every number in the file counts,
+  and "1,250" is read as one thousand two hundred fifty, where in a CSV it may
+  be two columns. probsim says how many numbers it read that way.
+- The leading digit is taken from the number as written, so very long numbers
+  and exponents are exact. Zeros have no leading digit and are left out (and
+  counted in the report).
+- Any encoding works for the numbers themselves (a Shift_JIS CSV, say): only
+  ASCII digits are read.
+- The test needs at least 110 numbers, so that every digit is expected at
+  least 5 times; below that probsim shows the counts without a p-value.
+- Benford's law fits data spanning several orders of magnitude (populations,
+  prices, transaction amounts). Data with a narrow range or assigned numbers
+  (heights, IDs, phone numbers) is not expected to follow it, so a mismatch is
+  not by itself a sign of anything wrong. For the built-in sequences (powers of
+  two, Fibonacci) the p-value treats them as if they were a random sample.
 
 ## How it works
 
 - Random numbers: xoshiro256** seeded through splitmix64, written in the
-  crate (no `rand`), so a seed gives the same result on every machine and
-  version. Integers in a range use Lemire's method, without modulo bias.
+  crate (no `rand`) and tested against the values of the authors' reference C
+  code. Integers in a range use Lemire's method, without modulo bias. The same
+  seed gives the same random numbers everywhere; results that also go through
+  floating-point functions (logarithms, for example) are expected to match but
+  not promised bit for bit across platforms.
 - Every trial is simulated step by step: the host really picks a door, the
   candidates are really shuffled. Nothing uses the formula it is checked
   against. Buffon's needle does not use pi either: a needle's angle comes
-  from a random point in a quarter disk.
+  from a random point in a quarter disk. `--explain` runs the same code with
+  the same random numbers, so the story is exactly what was simulated.
 - The exact answers are computed directly (the birthday product, n x H_n,
   the secretary sum (k/n) sum 1/j, and so on).
-- Intervals: Wilson score intervals for probabilities, mean +- z x standard
-  error for averages. A 95% interval misses the exact answer in about 1 run
-  in 20, which the text says when it happens; `--check` uses 99.9% so that a
-  correct simulation fails it about once in 1,000 runs.
+- Intervals: Wilson score intervals for probabilities (with no successes the
+  lower bound is exactly 0, with all successes the upper bound exactly 1), and
+  mean +- z x standard error for averages, given only from 30 trials up.
+  The dots on the chart are exact +- 1.96 x sd / sqrt(n), from the exact
+  standard deviation of one trial.
+- `--check` uses 99.9% intervals, so with enough trials a correct simulation
+  fails one check about once in 1,000 runs; `probsim all` makes six checks
+  (about 0.6%). In `all` each paradox gets its own random stream derived from
+  the seed; `--json` lists every one.
 - Benford: powers of two and Fibonacci numbers are exact while they fit in
   128 bits (2^127, F_186) and are computed from logarithms after that; a
   chi-square p-value comes from the regularized incomplete gamma function.

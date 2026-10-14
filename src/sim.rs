@@ -2,7 +2,7 @@
 
 use crate::paradox::{Measure, Paradox};
 use crate::rng::Rng;
-use crate::stats::{normal_interval, wilson, Running};
+use crate::stats::{normal_interval, wilson, Running, Z95};
 
 /// The estimate after `n` counted trials.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19,47 +19,35 @@ pub struct Outcome {
     pub attempted: u64,
     /// Trials that counted.
     pub counted: u64,
+    /// For a probability: how many counted trials were successes.
+    pub successes: u64,
+    /// The running mean and variance of the counted trials.
+    pub running: Running,
     pub estimate: f64,
     pub standard_error: f64,
-    /// 95% confidence interval.
-    pub ci95: (f64, f64),
+    /// 95% confidence interval, or None when there are too few trials for
+    /// an interval for an average to mean much.
+    pub ci95: Option<(f64, f64)>,
     pub theory: f64,
     pub checkpoints: Vec<Checkpoint>,
 }
 
 impl Outcome {
-    /// Whether the exact answer is inside the interval at confidence z
-    /// (`stats::Z95` for the printed 95% interval).
-    pub fn consistent(&self, z: f64) -> bool {
-        let (lo, hi) = interval(
-            self.paradox.measure(),
-            self.estimate,
-            self.standard_error,
-            self.counted,
-            z,
-        );
-        (lo..=hi).contains(&self.theory)
+    /// The interval at confidence z: Wilson for a probability, normal for an
+    /// average (None below `stats::MIN_FOR_MEAN` trials).
+    pub fn interval(&self, z: f64) -> Option<(f64, f64)> {
+        match self.paradox.measure() {
+            Measure::Probability => Some(wilson(self.successes, self.counted, z)),
+            Measure::Mean => normal_interval(&self.running, z),
+        }
     }
-}
 
-/// An interval at confidence z: Wilson for probabilities, normal for means.
-fn interval(m: Measure, estimate: f64, se: f64, n: u64, z: f64) -> (f64, f64) {
-    match m {
-        Measure::Probability => wilson_z(estimate, n, z),
-        Measure::Mean => (estimate - z * se, estimate + z * se),
+    /// Whether the exact answer is inside the interval at confidence z, or
+    /// None when there is no interval to judge by.
+    pub fn consistent(&self, z: f64) -> Option<bool> {
+        self.interval(z)
+            .map(|(lo, hi)| (lo..=hi).contains(&self.theory))
     }
-}
-
-fn wilson_z(p: f64, n: u64, z: f64) -> (f64, f64) {
-    if n == 0 {
-        return (0.0, 1.0);
-    }
-    let n = n as f64;
-    let z2 = z * z;
-    let denom = 1.0 + z2 / n;
-    let center = (p + z2 / (2.0 * n)) / denom;
-    let half = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / denom;
-    ((center - half).max(0.0), (center + half).min(1.0))
 }
 
 /// About `points` trial counts from 1 to `total`, evenly spaced on a log
@@ -83,62 +71,78 @@ pub fn checkpoint_counts(total: u64, points: usize) -> Vec<u64> {
     out
 }
 
-/// Run `trials` trials of `p`. A trial that does not count (see
-/// `Paradox::trial`) is still a trial run; checkpoints follow counted trials.
+/// A seed for the i-th of several runs started from one seed (splitmix64 of
+/// seed + i), so `probsim all` gives each paradox its own random stream.
+pub fn derived_seed(seed: u64, i: u64) -> u64 {
+    let mut z = seed.wrapping_add(i.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    // 53 bits, so the seed survives a trip through JSON numbers.
+    (z ^ (z >> 31)) & ((1 << 53) - 1)
+}
+
+/// Run `trials` trials of `p`. Checkpoints are log spaced over the counted
+/// trials. When some trials may not count, a first pass with the same seed
+/// finds how many will, so the checkpoints still spread over the whole run.
 pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
-    let mut rng = Rng::new(seed);
     let mut scratch = Vec::new();
+    let counted_total = if p.may_reject() {
+        let mut rng = Rng::new(seed);
+        (0..trials)
+            .filter(|_| p.trial(&mut rng, &mut scratch).is_some())
+            .count() as u64
+    } else {
+        trials
+    };
+    let mut rng = Rng::new(seed);
     let mut running = Running::default();
-    let marks = checkpoint_counts(trials, points);
+    let mut successes = 0u64;
+    let probability = p.measure() == Measure::Probability;
+    let estimate = |running: &Running, successes: u64| {
+        if probability && running.n > 0 {
+            successes as f64 / running.n as f64
+        } else {
+            running.mean()
+        }
+    };
+    let marks = checkpoint_counts(counted_total, points);
     let mut next_mark = 0;
-    let mut checkpoints = Vec::with_capacity(marks.len());
+    let mut checkpoints: Vec<Checkpoint> = Vec::with_capacity(marks.len());
     for _ in 0..trials {
         if let Some(x) = p.trial(&mut rng, &mut scratch) {
             running.push(x);
-            while next_mark < marks.len() && running.n >= marks[next_mark] {
+            if probability && x == 1.0 {
+                successes += 1;
+            }
+            if next_mark < marks.len() && running.n >= marks[next_mark] {
+                next_mark += 1;
                 checkpoints.push(Checkpoint {
                     n: running.n,
-                    estimate: running.mean(),
+                    estimate: estimate(&running, successes),
                 });
-                next_mark += 1;
             }
         }
     }
-    if checkpoints.last().map(|c| c.n) != Some(running.n) && running.n > 0 {
-        checkpoints.push(Checkpoint {
-            n: running.n,
-            estimate: running.mean(),
-        });
-    }
     let n = running.n;
-    let estimate = running.mean();
-    let (standard_error, ci95) = match p.measure() {
-        Measure::Probability => {
-            let se = if n == 0 {
-                0.0
-            } else {
-                (estimate * (1.0 - estimate) / n as f64).sqrt()
-            };
-            (se, wilson(estimate * n as f64, n))
-        }
-        Measure::Mean => {
-            let se = if n < 2 {
-                f64::INFINITY
-            } else {
-                (running.variance() / n as f64).sqrt()
-            };
-            (se, normal_interval(&running))
-        }
+    let est = estimate(&running, successes);
+    let standard_error = match p.measure() {
+        Measure::Probability if n > 0 => (est * (1.0 - est) / n as f64).sqrt(),
+        Measure::Mean if n >= 2 => (running.variance() / n as f64).sqrt(),
+        _ => f64::NAN,
     };
-    Outcome {
+    let mut o = Outcome {
         paradox: *p,
         seed,
         attempted: trials,
         counted: n,
-        estimate,
+        successes,
+        running,
+        estimate: est,
         standard_error,
-        ci95,
+        ci95: None,
         theory: p.theory(),
         checkpoints,
-    }
+    };
+    o.ci95 = o.interval(Z95);
+    o
 }

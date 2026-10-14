@@ -1,5 +1,7 @@
 //! The paradoxes: what each one asks, its exact answer, and one random trial.
 
+use std::fmt::Write as _;
+
 use crate::rng::Rng;
 use crate::stats::harmonic;
 
@@ -43,17 +45,34 @@ pub struct Texts {
     pub why: String,
     /// What one trial is called, plural ("games", "groups").
     pub unit: String,
+    /// What one trial is called, singular, for --explain ("Game", "Group").
+    pub one: String,
     /// What the estimate is ("switching wins").
     pub quantity: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Paradox {
-    MontyHall { doors: u32, host_knows: bool },
-    Birthday { people: u32, days: u32 },
-    Coupon { items: u32 },
-    Secretary { candidates: u32, skip: u32 },
-    Buffon { length: f64, spacing: f64 },
+    MontyHall {
+        doors: u32,
+        host_knows: bool,
+    },
+    Birthday {
+        people: u32,
+        days: u32,
+    },
+    Coupon {
+        items: u32,
+    },
+    Secretary {
+        candidates: u32,
+        skip: u32,
+    },
+    /// A needle of `length` on lines `spacing` apart; only the ratio matters.
+    Buffon {
+        length: f64,
+        spacing: f64,
+    },
 }
 
 /// Success probability of the secretary rule "reject the first `skip`, then
@@ -71,15 +90,25 @@ pub fn secretary_success(n: u32, skip: u32) -> f64 {
     skip as f64 / n_f * tail
 }
 
-/// The cutoff that maximizes `secretary_success`.
+/// The cutoff that maximizes `secretary_success`, in one pass: the tail sum
+/// is built from the top down. On a tie (within rounding) the smaller cutoff
+/// wins, so for two candidates it is 0.
 pub fn secretary_best_skip(n: u32) -> u32 {
-    (0..n)
-        .max_by(|&a, &b| {
-            secretary_success(n, a)
-                .partial_cmp(&secretary_success(n, b))
-                .unwrap()
-        })
-        .unwrap_or(0)
+    const TIE: f64 = 1e-15;
+    let mut best: Option<(u32, f64)> = None;
+    let mut tail = 0.0;
+    for k in (1..n).rev() {
+        tail += 1.0 / k as f64;
+        let p = k as f64 / n as f64 * tail;
+        // Going down, a later k is smaller, so it takes a tie.
+        if best.is_none_or(|(_, b)| p >= b - TIE) {
+            best = Some((k, p));
+        }
+    }
+    match best {
+        Some((k, p)) if p > 1.0 / n as f64 + TIE => k,
+        _ => 0,
+    }
 }
 
 /// P(at least two of `people` share a birthday) with `days` equally likely days.
@@ -94,6 +123,38 @@ pub fn birthday_probability(people: u32, days: u32) -> f64 {
     1.0 - all_different
 }
 
+/// A percentage with enough decimals to show a small value.
+pub fn pct(p: f64) -> String {
+    let v = p * 100.0;
+    if v == 0.0 || v >= 0.1 {
+        format!("{v:.1}%")
+    } else {
+        let decimals = ((-v.log10()).ceil() as usize + 1).clamp(2, 12);
+        format!("{v:.decimals$}%")
+    }
+}
+
+/// A parameter for text: plain for ordinary sizes, scientific otherwise.
+pub fn num(x: f64) -> String {
+    let a = x.abs();
+    if a == 0.0 || (1e-4..1e6).contains(&a) {
+        format!("{x}")
+    } else {
+        format!("{x:e}")
+    }
+}
+
+/// Pairs among `people`, in words.
+fn pairs(people: u32, lang: Lang) -> String {
+    let p = people as u64 * (people as u64).saturating_sub(1) / 2;
+    match (lang, people) {
+        (Lang::En, 1) => "a single person makes no pairs".to_string(),
+        (Lang::En, _) => format!("{people} people make {p} pairs, and any pair can match"),
+        (Lang::Ja, 1) => "1人では組ができません".to_string(),
+        (Lang::Ja, _) => format!("{people}人なら{p}組あり、どの組でも一致しえます"),
+    }
+}
+
 /// "another door, a goat" or "N other doors, all goats".
 fn others(k: u32) -> String {
     if k == 1 {
@@ -103,9 +164,8 @@ fn others(k: u32) -> String {
     }
 }
 
-fn pct(p: f64) -> String {
-    format!("{:.1}%", p * 100.0)
-}
+/// The story of one trial, for --explain: a buffer and its language.
+pub type Story<'a> = Option<(&'a mut String, Lang)>;
 
 impl Paradox {
     pub fn name(&self) -> &'static str {
@@ -116,6 +176,17 @@ impl Paradox {
             Paradox::Secretary { .. } => "secretary",
             Paradox::Buffon { .. } => "buffon",
         }
+    }
+
+    /// Whether some trials may not count (a random Monty Hall host).
+    pub fn may_reject(&self) -> bool {
+        matches!(
+            self,
+            Paradox::MontyHall {
+                host_knows: false,
+                ..
+            }
+        )
     }
 
     pub fn measure(&self) -> Measure {
@@ -139,7 +210,23 @@ impl Paradox {
             Paradox::Birthday { people, days } => birthday_probability(people, days),
             Paradox::Coupon { items } => items as f64 * harmonic(items as u64),
             Paradox::Secretary { candidates, skip } => secretary_success(candidates, skip),
-            Paradox::Buffon { length, spacing } => 2.0 * length / (std::f64::consts::PI * spacing),
+            Paradox::Buffon { length, spacing } => 2.0 * (length / spacing) / std::f64::consts::PI,
+        }
+    }
+
+    /// The exact variance of one trial: p(1 - p) for a probability, and for
+    /// the coupon collector n^2 * sum 1/k^2 - n * H_n.
+    pub fn theory_variance(&self) -> f64 {
+        match *self {
+            Paradox::Coupon { items } => {
+                let n = items as f64;
+                let squares: f64 = (1..=items as u64).rev().map(|k| 1.0 / (k * k) as f64).sum();
+                n * n * squares - n * harmonic(items as u64)
+            }
+            _ => {
+                let p = self.theory();
+                p * (1.0 - p)
+            }
         }
     }
 
@@ -175,16 +262,35 @@ impl Paradox {
                 ("candidates", candidates.to_string()),
                 ("skip", skip.to_string()),
             ],
-            Paradox::Buffon { length, spacing } => vec![
-                ("length", length.to_string()),
-                ("spacing", spacing.to_string()),
-            ],
+            Paradox::Buffon { length, spacing } => {
+                vec![
+                    ("length", format!("{length:e}")),
+                    ("spacing", format!("{spacing:e}")),
+                ]
+            }
         }
     }
 
     /// One trial, or None when the trial does not count (a random Monty Hall
     /// host who revealed the car).
     pub fn trial(&self, rng: &mut Rng, scratch: &mut Vec<u32>) -> Option<f64> {
+        self.run(rng, scratch, None)
+    }
+
+    /// One trial with its story told: the same code and the same random
+    /// numbers as `trial`, so the story is exactly what was simulated.
+    pub fn explain(
+        &self,
+        rng: &mut Rng,
+        scratch: &mut Vec<u32>,
+        lang: Lang,
+    ) -> (Option<f64>, String) {
+        let mut s = String::new();
+        let result = self.run(rng, scratch, Some((&mut s, lang)));
+        (result, s)
+    }
+
+    fn run(&self, rng: &mut Rng, scratch: &mut Vec<u32>, mut story: Story) -> Option<f64> {
         match *self {
             Paradox::MontyHall { doors, host_knows } => {
                 let n = doors as u64;
@@ -192,39 +298,91 @@ impl Paradox {
                 let pick = rng.below(n);
                 // The host opens every door except your pick and one other:
                 // `kept` is the one he leaves closed for you to switch to.
-                let kept = if host_knows {
-                    if car != pick {
-                        car
-                    } else {
-                        // Any other door; all of them hide goats.
-                        let k = rng.below(n - 1);
-                        if k >= pick {
-                            k + 1
-                        } else {
-                            k
-                        }
-                    }
+                // A host who knows keeps the car closed when you missed it;
+                // otherwise he keeps a door chosen at random.
+                let other_than_pick = |k: u64| if k >= pick { k + 1 } else { k };
+                let kept = if host_knows && car != pick {
+                    car
                 } else {
-                    let k = rng.below(n - 1);
-                    let kept = if k >= pick { k + 1 } else { k };
-                    // He opened every door but `pick` and `kept`; if the car
-                    // was among them, this game is not the situation asked about.
-                    if car != pick && car != kept {
-                        return None;
-                    }
-                    kept
+                    other_than_pick(rng.below(n - 1))
                 };
-                Some(if kept == car { 1.0 } else { 0.0 })
+                let revealed = car != pick && car != kept;
+                let wins = kept == car;
+                if let Some((s, lang)) = story.as_mut() {
+                    let (c, p, k, o) = (car + 1, pick + 1, kept + 1, n - 2);
+                    let _ = match (lang, revealed) {
+                        (Lang::En, true) => write!(
+                            s,
+                            "car behind door {c}, you pick door {p}; the host, opening doors at random, \
+                             leaves door {k} closed and reveals the car: this game does not count"
+                        ),
+                        (Lang::En, false) => write!(
+                            s,
+                            "car behind door {c}, you pick door {p}; the host leaves door {k} closed and \
+                             opens {}; switching to door {k} {}",
+                            if o == 1 { "the other door".to_string() } else { format!("the other {o}") },
+                            if wins { "wins" } else { "loses" }
+                        ),
+                        (Lang::Ja, true) => write!(
+                            s,
+                            "車はドア{c}、あなたはドア{p}を選択。でたらめに開ける司会者がドア{k}を残して開けたら\
+                             車が出てしまった: このゲームは数えない"
+                        ),
+                        (Lang::Ja, false) => write!(
+                            s,
+                            "車はドア{c}、あなたはドア{p}を選択。司会者はドア{k}を残して他の{o}枚を開ける。\
+                             ドア{k}に変えると{}",
+                            if wins { "当たり" } else { "はずれ" }
+                        ),
+                    };
+                }
+                if revealed {
+                    // Only possible with a random host: not the situation asked about.
+                    return None;
+                }
+                Some(if wins { 1.0 } else { 0.0 })
             }
             Paradox::Birthday { people, days } => {
-                scratch.clear();
-                scratch.resize(days as usize, 0);
-                for _ in 0..people {
+                // scratch[d] holds the generation that last saw day d, and
+                // scratch[days] the current generation, so the days are not
+                // cleared on every trial.
+                let d_len = days as usize;
+                if scratch.len() != d_len + 1 {
+                    scratch.clear();
+                    scratch.resize(d_len + 1, 0);
+                }
+                let mut generation = scratch[d_len].wrapping_add(1);
+                if generation == 0 {
+                    scratch.iter_mut().for_each(|x| *x = 0);
+                    generation = 1;
+                }
+                scratch[d_len] = generation;
+                for person in 1..=people {
                     let d = rng.below(days as u64) as usize;
-                    if scratch[d] == 1 {
+                    if scratch[d] == generation {
+                        if let Some((s, lang)) = story.as_mut() {
+                            let _ = match lang {
+                                Lang::En => write!(
+                                    s,
+                                    "person {person} has day {} like someone before: a shared birthday",
+                                    d + 1
+                                ),
+                                Lang::Ja => write!(
+                                    s,
+                                    "{person}人目の誕生日{}日目は先に来た人と同じ: 一致あり",
+                                    d + 1
+                                ),
+                            };
+                        }
                         return Some(1.0);
                     }
-                    scratch[d] = 1;
+                    scratch[d] = generation;
+                }
+                if let Some((s, lang)) = story.as_mut() {
+                    let _ = match lang {
+                        Lang::En => write!(s, "all {people} birthdays differ: no shared birthday"),
+                        Lang::Ja => write!(s, "{people}人全員の誕生日が異なる: 一致なし"),
+                    };
                 }
                 Some(0.0)
             }
@@ -232,13 +390,41 @@ impl Paradox {
                 scratch.clear();
                 scratch.resize(items as usize, 0);
                 let (mut missing, mut draws) = (items, 0u64);
+                let mut seen: Vec<u64> = Vec::new();
+                let mut last = 0;
                 while missing > 0 {
                     draws += 1;
                     let i = rng.below(items as u64) as usize;
+                    if story.is_some() && seen.len() < 40 {
+                        seen.push(i as u64 + 1);
+                    }
                     if scratch[i] == 0 {
                         scratch[i] = 1;
                         missing -= 1;
+                        last = i + 1;
                     }
+                }
+                if let Some((s, lang)) = story.as_mut() {
+                    let list = seen
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let more = if draws as usize > seen.len() {
+                        " ..."
+                    } else {
+                        ""
+                    };
+                    let _ = match lang {
+                        Lang::En => write!(
+                            s,
+                            "drew {list}{more}: complete after {draws} draws, the last new item was {last}"
+                        ),
+                        Lang::Ja => write!(
+                            s,
+                            "{list}{more} と引いて{draws}回でコンプリート。最後にそろったのは{last}番"
+                        ),
+                    };
                 }
                 Some(draws as f64)
             }
@@ -249,16 +435,53 @@ impl Paradox {
                 rng.shuffle(scratch);
                 let k = skip as usize;
                 let bar = scratch[..k].iter().max().copied();
-                let hired = scratch[k..].iter().find(|&&s| bar.is_none_or(|b| s > b));
-                Some(if hired == Some(&(candidates - 1)) {
-                    1.0
-                } else {
-                    0.0
-                })
+                let hired = scratch[k..]
+                    .iter()
+                    .position(|&s| bar.is_none_or(|b| s > b))
+                    .map(|i| (k + i, scratch[k + i]));
+                let best = hired.is_some_and(|(_, s)| s == candidates - 1);
+                if let Some((s, lang)) = story.as_mut() {
+                    let bar_text = match (*lang, bar) {
+                        (Lang::En, Some(b)) => {
+                            format!("the first {k} set the bar at score {}", b + 1)
+                        }
+                        (Lang::En, None) => "no one is skipped".to_string(),
+                        (Lang::Ja, Some(b)) => format!("最初の{k}人で基準はスコア{}", b + 1),
+                        (Lang::Ja, None) => "見送りなし".to_string(),
+                    };
+                    let _ = match (*lang, hired) {
+                        (Lang::En, Some((i, sc))) => write!(
+                            s,
+                            "{bar_text}; candidate {} beats it with score {} of {candidates}: {}",
+                            i + 1,
+                            sc + 1,
+                            if best { "the best, hired" } else { "hired, but not the best" }
+                        ),
+                        (Lang::En, None) => write!(
+                            s,
+                            "{bar_text}; no one after beats it, because the best was among the first {k}"
+                        ),
+                        (Lang::Ja, Some((i, sc))) => write!(
+                            s,
+                            "{bar_text}。{}人目がスコア{}(最高{candidates})で上回り採用: {}",
+                            i + 1,
+                            sc + 1,
+                            if best { "最も優秀な人" } else { "最も優秀な人ではない" }
+                        ),
+                        (Lang::Ja, None) => write!(
+                            s,
+                            "{bar_text}。最も優秀な人が最初の{k}人にいたので、誰も上回れない"
+                        ),
+                    };
+                }
+                Some(if best { 1.0 } else { 0.0 })
             }
             Paradox::Buffon { length, spacing } => {
+                // In units of the line spacing, so only the ratio matters and
+                // no product or quotient of the raw inputs can overflow.
+                let r = length / spacing;
                 // Distance from the needle's center to the nearest line.
-                let y = rng.f64() * spacing / 2.0;
+                let y = rng.f64() / 2.0;
                 // A uniform angle without using pi: a uniform point in the
                 // quarter disk has a uniform angle.
                 let sin = loop {
@@ -268,7 +491,24 @@ impl Paradox {
                         break b / r2.sqrt();
                     }
                 };
-                Some(if y <= length / 2.0 * sin { 1.0 } else { 0.0 })
+                let reach = r / 2.0 * sin;
+                let crosses = y <= reach;
+                if let Some((s, lang)) = story.as_mut() {
+                    let _ =
+                        match lang {
+                            Lang::En => write!(
+                            s,
+                            "center {y:.3} spacings from a line, the needle reaches {reach:.3}: {}",
+                            if crosses { "crosses" } else { "misses" }
+                        ),
+                            Lang::Ja => write!(
+                            s,
+                            "中心から線までの距離{y:.3}(間隔を1とする)、針が届く距離{reach:.3}: {}",
+                            if crosses { "交わる" } else { "交わらない" }
+                        ),
+                        };
+                }
+                Some(if crosses { 1.0 } else { 0.0 })
             }
         }
     }
@@ -291,6 +531,7 @@ impl Paradox {
                      so in every other case the car is behind the door he leaves closed."
                 ),
                 unit: "games".into(),
+                one: "Game".into(),
                 quantity: "switching wins".into(),
             },
             (Paradox::MontyHall { doors, host_knows: true }, Lang::Ja) => Texts {
@@ -307,6 +548,7 @@ impl Paradox {
                      場合はすべて、司会者が閉じたまま残したドアに車があります。"
                 ),
                 unit: "回".into(),
+                one: "ゲーム目".into(),
                 quantity: "変えて当たる確率".into(),
             },
             (Paradox::MontyHall { doors, host_knows: false }, Lang::En) => Texts {
@@ -327,6 +569,7 @@ impl Paradox {
                       was revealed are left out of the count."
                     .into(),
                 unit: "games".into(),
+                one: "Game".into(),
                 quantity: "switching wins".into(),
             },
             (Paradox::MontyHall { doors, host_knows: false }, Lang::Ja) => Texts {
@@ -342,6 +585,7 @@ impl Paradox {
                       残すと、変えれば当たっていたはずのケースの多くが除かれます。車が開いたゲームは数えません。"
                     .into(),
                 unit: "回".into(),
+                one: "ゲーム目".into(),
                 quantity: "変えて当たる確率".into(),
             },
             (Paradox::Birthday { people, days }, Lang::En) => Texts {
@@ -350,16 +594,19 @@ impl Paradox {
                     "In a group of {people} people, how likely is it that at least two share a birthday? \
                      (Each of {days} days equally likely.)"
                 ),
-                intuition: format!(
-                    "{people} people out of {days} days is only {}, so a shared birthday should be rare.",
-                    pct(people as f64 / days as f64)
-                ),
+                intuition: if people > days {
+                    "With more people than days, a shared birthday is certain (the pigeonhole principle).".into()
+                } else {
+                    format!(
+                        "{people} people for {days} days covers only {} of the days, so a shared birthday \
+                         should be rare.",
+                        pct(people as f64 / days as f64)
+                    )
+                },
                 truth: format!("At least two share a birthday with probability {}.", pct(p)),
-                why: format!(
-                    "What matters is pairs, not people: {people} people make {} pairs, and any pair can match.",
-                    people as u64 * (people as u64).saturating_sub(1) / 2
-                ),
+                why: format!("What matters is pairs, not people: {}.", pairs(people, Lang::En)),
                 unit: "groups".into(),
+                one: "Group".into(),
                 quantity: "a shared birthday".into(),
             },
             (Paradox::Birthday { people, days }, Lang::Ja) => Texts {
@@ -367,16 +614,18 @@ impl Paradox {
                 question: format!(
                     "{people}人のグループで、誕生日が同じ人が少なくとも1組いる確率は?(誕生日は{days}日のどれも同じ確率)"
                 ),
-                intuition: format!(
-                    "{days}日に対して{people}人は{}にすぎないので、同じ誕生日はめったにないはず。",
-                    pct(people as f64 / days as f64)
-                ),
+                intuition: if people > days {
+                    "日数より人数が多いので、必ず誰かの誕生日が重なる(鳩の巣原理)。".into()
+                } else {
+                    format!(
+                        "{days}日に対して{people}人は日数の{}にすぎないので、同じ誕生日はめったにないはず。",
+                        pct(people as f64 / days as f64)
+                    )
+                },
                 truth: format!("少なくとも1組が同じ誕生日になる確率は{}です。", pct(p)),
-                why: format!(
-                    "効くのは人数ではなく組の数です。{people}人なら{}組あり、どの組でも一致しえます。",
-                    people as u64 * (people as u64).saturating_sub(1) / 2
-                ),
+                why: format!("効くのは人数ではなく組の数です。{}。", pairs(people, Lang::Ja)),
                 unit: "グループ".into(),
+                one: "グループ目".into(),
                 quantity: "同じ誕生日がいる確率".into(),
             },
             (Paradox::Coupon { items }, Lang::En) => Texts {
@@ -392,6 +641,7 @@ impl Paradox {
                      probability 1/{items}, so that last item alone takes {items} draws on average."
                 ),
                 unit: "collectors".into(),
+                one: "Collector".into(),
                 quantity: "draws to complete".into(),
             },
             (Paradox::Coupon { items }, Lang::Ja) => Texts {
@@ -406,6 +656,7 @@ impl Paradox {
                      1種だけで平均{items}回かかります。"
                 ),
                 unit: "人".into(),
+                one: "人目".into(),
                 quantity: "そろうまでの回数".into(),
             },
             (Paradox::Secretary { candidates, skip }, Lang::En) => Texts {
@@ -428,6 +679,7 @@ impl Paradox {
                       reject and the chance of success both approach 1/e, about 36.8%."
                     .into(),
                 unit: "hirings".into(),
+                one: "Hiring".into(),
                 quantity: "the best is hired".into(),
             },
             (Paradox::Secretary { candidates, skip }, Lang::Ja) => Texts {
@@ -450,13 +702,16 @@ impl Paradox {
                       1/e(約36.8%)に近づきます。"
                     .into(),
                 unit: "回".into(),
+                one: "回目".into(),
                 quantity: "最も優秀な人を採用する確率".into(),
             },
             (Paradox::Buffon { length, spacing }, Lang::En) => Texts {
-                title: format!("Buffon's needle (length {length}, lines {spacing} apart)"),
+                title: format!("Buffon's needle (length {}, lines {} apart)", num(length), num(spacing)),
                 question: format!(
-                    "Drop a needle of length {length} on a floor ruled with lines {spacing} apart. How often \
-                     does it cross a line?"
+                    "Drop a needle of length {} on a floor ruled with lines {} apart. How often does it \
+                     cross a line?",
+                    num(length),
+                    num(spacing)
                 ),
                 intuition: "Hard to say, and surely nothing to do with circles.".into(),
                 truth: format!(
@@ -468,12 +723,15 @@ impl Paradox {
                       point in a quarter disk."
                     .into(),
                 unit: "needles".into(),
+                one: "Needle".into(),
                 quantity: "a needle crosses a line".into(),
             },
             (Paradox::Buffon { length, spacing }, Lang::Ja) => Texts {
-                title: format!("ビュフォンの針(長さ{length}、線の間隔{spacing})"),
+                title: format!("ビュフォンの針(長さ{}、線の間隔{})", num(length), num(spacing)),
                 question: format!(
-                    "間隔{spacing}で平行線を引いた床に、長さ{length}の針を落とします。針が線と交わる確率は?"
+                    "間隔{}で平行線を引いた床に、長さ{}の針を落とします。針が線と交わる確率は?",
+                    num(spacing),
+                    num(length)
                 ),
                 intuition: "見当がつかないし、円とは関係なさそう。".into(),
                 truth: format!(
@@ -484,6 +742,7 @@ impl Paradox {
                       自体はπを使いません。角度は四分円の中のランダムな点から作っています。"
                     .into(),
                 unit: "本".into(),
+                one: "本目".into(),
                 quantity: "針が線と交わる確率".into(),
             },
         }
