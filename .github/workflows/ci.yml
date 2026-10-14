@@ -30,3 +30,19 @@ jobs:
       - run: cargo build --release
       # A fixed seed, so the self-check is deterministic.
       - run: ./target/release/probsim all --seed 2026 --check
+      # Every JSON shape must parse.
+      - name: JSON output parses
+        run: |
+          b=./target/release/probsim
+          for args in "all --trials 2000 --seed 1" "monty-hall --random-host --explain 3 --trials 500" \
+                      "coupon --trials 3" "buffon --trials 1" "birthday --people 1 --trials 10" \
+                      "benford --trials 50" "benford --source fibonacci --trials 5000"; do
+            $b $args --json | python3 -m json.tool > /dev/null
+          done
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.82
+      - run: cargo test --all
