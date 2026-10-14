@@ -294,3 +294,39 @@ fn benford_test_tells_uniform_from_benford() {
         count_digits(&powers_of_two(500))
     );
 }
+
+#[test]
+fn files_more_like_real_life() {
+    // A quoted field may span lines (RFC 4180).
+    let s = scan_csv(
+        "note,amount\n\"first\nsecond\",250\n\"x\",\"1,300\"\r\n",
+        2,
+        ',',
+    );
+    assert_eq!((s.numbers, s.counts[1], s.counts[0]), (2, 1, 1));
+    // A point with no digits after it is still part of the number.
+    assert_eq!(
+        texts("1.e3 2.e4 0.e5 3."),
+        vec!["1.e3", "2.e4", "0.e5", "3."]
+    );
+    // Encodings.
+    let utf16le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain("123\n456\n".encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    assert_eq!(
+        benford::scan_text(&benford::decode(&utf16le).unwrap()).numbers,
+        2
+    );
+    let utf16be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain("78".encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    assert_eq!(benford::decode(&utf16be).unwrap(), "78");
+    let no_bom: Vec<u8> = "123".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert!(benford::decode(&no_bom).is_err());
+    assert_eq!(
+        benford::scan_text(&benford::decode(b"\x94\x84 12").unwrap()).numbers,
+        1
+    );
+}

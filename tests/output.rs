@@ -259,3 +259,38 @@ fn json_has_the_fields() {
         "{fj}"
     );
 }
+
+#[test]
+fn the_band_is_left_out_where_the_normal_approximation_fails() {
+    let plot = |l: &String| {
+        l.split_once('|')
+            .map_or(String::new(), |(_, p)| p.to_string())
+    };
+    // p = 0.001 and up to 100 trials: n p < 5 everywhere, so no band.
+    let pts: Vec<Checkpoint> = [(1, 0.0), (10, 0.0), (100, 0.01)]
+        .iter()
+        .map(|&(n, e)| Checkpoint { n, estimate: e })
+        .collect();
+    let lines = chart(
+        &pts,
+        0.001,
+        Measure::Probability,
+        30,
+        9,
+        Some((0.001f64 * 0.999).sqrt()),
+    );
+    assert!(
+        lines.iter().take(9).all(|l| !plot(l).contains('.')),
+        "{lines:#?}"
+    );
+    // With p = 0.5 the band is drawn.
+    let pts: Vec<Checkpoint> = [(10, 0.4), (1000, 0.51), (100_000, 0.5)]
+        .iter()
+        .map(|&(n, e)| Checkpoint { n, estimate: e })
+        .collect();
+    let lines = chart(&pts, 0.5, Measure::Probability, 30, 9, Some(0.5));
+    assert!(
+        lines.iter().take(9).any(|l| plot(l).contains('.')),
+        "{lines:#?}"
+    );
+}

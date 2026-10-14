@@ -141,8 +141,8 @@ fn value(m: Measure, x: f64) -> String {
 
 /// The running estimate against the exact answer, on a log scale of trials.
 /// With `sd` (the exact standard deviation of one trial), dots mark the band
-/// exact +- 1.96 sd / sqrt(n) that a run stays inside 95% of the time at
-/// each n: it narrows like 1/sqrt(n).
+/// exact +- 1.96 sd / sqrt(n), where by the normal approximation about 95% of
+/// runs are at each n: it narrows like 1/sqrt(n).
 pub fn chart(
     points: &[Checkpoint],
     theory: f64,
@@ -201,8 +201,18 @@ pub fn chart(
     };
     let mut grid = vec![vec![' '; width]; height];
     if let Some(sd) = sd.filter(|s| s.is_finite() && *s > 0.0) {
-        for (col, _) in (0..width).map(|c| (c, ())) {
-            let h = Z95 * sd / n_at(col).sqrt();
+        for (col, n) in (0..width).map(|c| (c, n_at(c))) {
+            // The band is a normal approximation: drawn only where it holds
+            // (n p and n (1 - p) at least 5 for a probability, 30 trials for
+            // an average).
+            let holds = match m {
+                Measure::Probability => n * theory >= 5.0 && n * (1.0 - theory) >= 5.0,
+                Measure::Mean => n >= MIN_FOR_MEAN as f64,
+            };
+            if !holds {
+                continue;
+            }
+            let h = Z95 * sd / n.sqrt();
             for v in [theory + h, theory - h] {
                 if v <= top && v >= bottom {
                     grid[row_of(v)][col] = '.';
@@ -301,7 +311,8 @@ fn labels(lang: Lang) -> Labels {
                       in about 1 run in 20)",
             too_few: "too few trials for an interval for an average (need at least 30)",
             convergence: "Convergence",
-            legend: "- exact answer   * this run   . where 95% of runs stay at each point",
+            legend: "- exact answer   * this run   . where about 95% of runs stay (normal approximation, \
+                     drawn where it holds)",
         },
         Lang::Ja => Labels {
             intuition: "直感:      ",
@@ -312,7 +323,7 @@ fn labels(lang: Lang) -> Labels {
             outside: "正解が95%信頼区間の外側です(試行が十分多ければ、20回に1回ほどは起こります)",
             too_few: "平均の信頼区間を出すには試行が少なすぎます(30回以上必要)",
             convergence: "収束",
-            legend: "- 正解   * 今回の結果   . 各時点で95%の実行が収まる範囲",
+            legend: "- 正解   * 今回の結果   . 各時点で約95%の実行が収まる範囲(正規近似、近似が成り立つ範囲のみ)",
         },
     }
 }

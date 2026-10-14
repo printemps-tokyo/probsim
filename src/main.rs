@@ -286,10 +286,9 @@ fn source(a: &Args) -> Result<Source, String> {
         if a.source.as_deref().is_some_and(|s| s != "file") {
             return Err("--file reads your numbers; leave out --source".into());
         }
-        // Not necessarily UTF-8 (a Shift_JIS CSV, say): numbers are ASCII,
-        // so anything else is replaced and ignored.
+        // Not necessarily UTF-8 (a Shift_JIS CSV, say): see benford::decode.
         let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
-        let text = String::from_utf8_lossy(&bytes);
+        let text = benford::decode(&bytes).map_err(|e| format!("{path:?}: {e}"))?;
         let scan = match a.column {
             Some(c) => benford::scan_csv(&text, c, a.delimiter.unwrap_or(',')),
             None => benford::scan_text(&text),

@@ -36,13 +36,13 @@ Convergence: switching wins, by number of games (log scale)
   0.60122 |   v vvvvvvvvvv        .
           +--------------------------------------------------
            1                      316                    100k
-  - exact answer   * this run   . where 95% of runs stay at each point
+  - exact answer   * this run   . where about 95% of runs stay (normal approximation, drawn where it holds)
 ```
 
 Each paradox comes with the question, what intuition says, the exact answer
 and why, then a simulation with a 95% confidence interval and a chart of the
 running estimate settling onto the exact value, inside a funnel that narrows
-like 1/sqrt(n). `--explain N` tells the first trials step by step.
+like 1/sqrt(n) (where its normal approximation holds). `--explain N` tells the first trials step by step.
 Explanations are in English or Japanese (`--lang ja`).
 
 ## Install
@@ -137,8 +137,9 @@ freedom).
 - The leading digit is taken from the number as written, so very long numbers
   and exponents are exact. Zeros have no leading digit and are left out (and
   counted in the report).
-- Any encoding works for the numbers themselves (a Shift_JIS CSV, say): only
-  ASCII digits are read.
+- Encodings: UTF-8 and other ASCII-compatible encodings (Shift_JIS, EUC-JP,
+  Latin-1, ...) work as they are, since only the ASCII digits are read;
+  UTF-16 needs a byte order mark. A quoted CSV field may span lines.
 - The test needs at least 110 numbers, so that every digit is expected at
   least 5 times; below that probsim shows the counts without a p-value.
 - Benford's law fits data spanning several orders of magnitude (populations,
@@ -166,7 +167,9 @@ freedom).
   lower bound is exactly 0, with all successes the upper bound exactly 1), and
   mean +- z x standard error for averages, given only from 30 trials up.
   The dots on the chart are exact +- 1.96 x sd / sqrt(n), from the exact
-  standard deviation of one trial.
+  standard deviation of one trial: by the normal approximation, about 95% of
+  runs are inside at each point. They are drawn only where that holds (n p
+  and n (1 - p) at least 5 for a probability, 30 trials for an average).
 - `--check` uses 99.9% intervals, so with enough trials a correct simulation
   fails one check about once in 1,000 runs; `probsim all` makes six checks
   (about 0.6%). In `all` each paradox gets its own random stream derived from

@@ -165,7 +165,11 @@ pub fn number_tokens(text: &str) -> Vec<Token> {
                 i += 4;
             }
         }
-        if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+        // A decimal point, with or without digits after it ("1.5", "1.e3").
+        if i < b.len()
+            && b[i] == b'.'
+            && (i + 1 < b.len() && b[i + 1].is_ascii_digit() || i > int_start)
+        {
             let f = i;
             i += 1;
             while i < b.len() && b[i].is_ascii_digit() {
@@ -191,12 +195,14 @@ pub fn number_tokens(text: &str) -> Vec<Token> {
     out
 }
 
-/// The fields of one CSV line: split at `delimiter` outside double quotes,
-/// with "" inside quotes standing for a quote.
-pub fn csv_fields(line: &str, delimiter: char) -> Vec<String> {
+/// CSV records: fields split at `delimiter` outside double quotes, records
+/// at line ends outside quotes (so a quoted field may span lines), and ""
+/// inside quotes standing for a quote (RFC 4180).
+pub fn csv_records(text: &str, delimiter: char) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
     let mut fields = vec![String::new()];
     let mut quoted = false;
-    let mut chars = line.chars().peekable();
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '"' if quoted && chars.peek() == Some(&'"') => {
@@ -204,11 +210,24 @@ pub fn csv_fields(line: &str, delimiter: char) -> Vec<String> {
                 fields.last_mut().unwrap().push('"');
             }
             '"' => quoted = !quoted,
+            '\r' if !quoted && chars.peek() == Some(&'\n') => {}
+            '\n' if !quoted => records.push(std::mem::replace(&mut fields, vec![String::new()])),
             c if c == delimiter && !quoted => fields.push(String::new()),
             c => fields.last_mut().unwrap().push(c),
         }
     }
-    fields
+    if fields.len() > 1 || !fields[0].is_empty() {
+        records.push(fields);
+    }
+    records
+}
+
+/// The fields of one CSV line (see `csv_records`).
+pub fn csv_fields(line: &str, delimiter: char) -> Vec<String> {
+    csv_records(line, delimiter)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 /// What a scan of a file found.
@@ -246,12 +265,12 @@ pub fn scan_text(text: &str) -> Scan {
     s
 }
 
-/// The numbers in one column (1-based) of CSV text. Lines without that
+/// The numbers in one column (1-based) of CSV text. Records without that
 /// column, and fields without a number (a header), are skipped.
 pub fn scan_csv(text: &str, column: usize, delimiter: char) -> Scan {
     let mut s = Scan::default();
-    for line in text.lines() {
-        if let Some(field) = csv_fields(line, delimiter).get(column - 1) {
+    for record in csv_records(text, delimiter) {
+        if let Some(field) = record.get(column - 1) {
             for t in number_tokens(field) {
                 s.add(&t);
             }
@@ -383,5 +402,34 @@ pub fn texts(source: &Source, lang: Lang) -> [String; 5] {
              9から10までよりずっと広いからです。"
                 .into(),
         ],
+    }
+}
+
+/// Text from a file's bytes: UTF-16 with a byte order mark is decoded;
+/// anything else is read as an ASCII-compatible encoding (UTF-8, Shift_JIS,
+/// EUC-JP, Latin-1...), where only the ASCII digits matter. NUL bytes without
+/// a byte order mark (UTF-16 without one, or a binary file) are refused,
+/// since the digits would be read apart.
+pub fn decode(bytes: &[u8]) -> Result<String, String> {
+    let utf16 = |be: bool| {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if be {
+                    u16::from_be_bytes([c[0], c[1]])
+                } else {
+                    u16::from_le_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, ..] => Ok(utf16(false)),
+        [0xFE, 0xFF, ..] => Ok(utf16(true)),
+        _ if bytes.contains(&0) => Err(
+            "the file contains NUL bytes: UTF-16 without a byte order mark, or not text; save it as UTF-8".into(),
+        ),
+        _ => Ok(String::from_utf8_lossy(bytes).into_owned()),
     }
 }
