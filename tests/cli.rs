@@ -526,9 +526,12 @@ fn a_sweep_is_costed_as_a_whole() {
 #[test]
 fn the_exact_answer_counts_toward_the_cost() {
     let (code, _, err) = probsim(&[
-        "sweep", "coupon", "--vary", "budget", "--from", "40000", "--to", "50000", "--steps", "200", "--items", "10000",
-        "--trials", "1", "--json",
+        "sweep", "coupon", "--vary", "budget", "--from", "40000", "--to", "50000", "--steps",
+        "200", "--items", "10000", "--trials", "1", "--json",
     ]);
     assert_eq!(code, 2);
-    assert!(err.contains("this sweep would take about"), "{err}");
+    assert!(
+        err.contains("the exact answers alone") && err.contains("--steps"),
+        "{err}"
+    );
 }

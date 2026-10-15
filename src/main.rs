@@ -735,10 +735,15 @@ const MAX_WORK: f64 = 2e10;
 /// Refuse a run of `runs` x `trials` that would take too long, suggesting
 /// a --trials (per run) that fits, as a plain number ready to paste.
 fn affordable(p: &Paradox, trials: u64, runs: u64) -> Result<(), String> {
-    let w = work(p, trials) * runs as f64;
+    let exact_cost = probsim::paradox::theory_cost(p);
+    if exact_cost > MAX_WORK {
+        return Err(format!("the exact answer alone would take about {exact_cost:.0e} steps; use smaller parameters"));
+    }
+    // The exact answer is computed once; the trials run `runs` times.
+    let w = (work(p, trials) - exact_cost) * runs as f64 + exact_cost;
     if w > MAX_WORK {
-        let per_trial = w / (trials as f64 * runs as f64);
-        let suggest = ((MAX_WORK / (per_trial * runs as f64)).floor() as u64).max(1);
+        let per_trial = (w - exact_cost) / (trials as f64 * runs as f64);
+        let suggest = (((MAX_WORK - exact_cost) / (per_trial * runs as f64)).floor() as u64).max(1);
         return Err(format!(
             "this would take about {w:.0e} steps; use --trials {suggest} or fewer"
         ));
@@ -868,10 +873,20 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
             // anything runs.
             let prepared = study::prepare(&values, make)?;
             let total: f64 = prepared.iter().map(|(_, p)| work(p, trials)).sum();
+            let exact_cost: f64 = prepared
+                .iter()
+                .map(|(_, p)| probsim::paradox::theory_cost(p))
+                .sum();
+            if exact_cost > MAX_WORK {
+                return Err(format!(
+                    "the exact answers alone would take about {exact_cost:.0e} steps; use fewer --steps or a smaller range"
+                ));
+            }
             if total > MAX_WORK {
-                let per_trial = total / (trials as f64 * prepared.len() as f64);
-                let suggest =
-                    ((MAX_WORK / (per_trial * prepared.len() as f64)).floor() as u64).max(1);
+                let per_trial = (total - exact_cost) / (trials as f64 * prepared.len() as f64);
+                let suggest = (((MAX_WORK - exact_cost) / (per_trial * prepared.len() as f64))
+                    .floor() as u64)
+                    .max(1);
                 return Err(format!(
                     "this sweep would take about {total:.0e} steps; use --trials {suggest} or fewer (per point)"
                 ));
