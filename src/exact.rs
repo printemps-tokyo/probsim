@@ -72,26 +72,59 @@ pub fn birthday_probability_weighted(people: u32, probs: &[f64]) -> f64 {
 /// Expected draws to collect every item when item i comes with probability
 /// `probs[i]`: E[T] = integral_0^inf (1 - prod_i (1 - e^{-p_i t})) dt
 /// (Flajolet, Gardy and Thimonier, "Birthday paradox, coupon collectors,
-/// caching algorithms and self-organizing search", 1992), by adaptive Simpson.
-pub fn coupon_mean_weighted(probs: &[f64]) -> f64 {
-    let f = |t: f64| 1.0 - probs.iter().map(|&p| 1.0 - (-p * t).exp()).product::<f64>();
+/// caching algorithms and self-organizing search", 1992), by adaptive
+/// Simpson. The integrand is computed as -expm1(sum ln1p(-e^{-p_i t})), which
+/// keeps its precision in the tail and over thousands of items, and the
+/// tolerance is relative to the integral. None if it does not converge
+/// within a budget of evaluations.
+pub fn coupon_mean_weighted(probs: &[f64]) -> Option<f64> {
+    let f = |t: f64| {
+        -probs
+            .iter()
+            .map(|&p| (-(-p * t).exp()).ln_1p())
+            .sum::<f64>()
+            .exp_m1()
+    };
     let p_min = probs.iter().copied().fold(f64::INFINITY, f64::min);
+    let p_max = probs.iter().copied().fold(0.0, f64::max);
+    if p_min.is_nan() || p_min <= 0.0 {
+        return None;
+    }
     // Past this point the integrand is below n * e^-45.
     let end = ((probs.len() as f64).ln() + 45.0) / p_min;
-    // Split at the scale of each rate so no feature is stepped over.
+    if !end.is_finite() {
+        return None;
+    }
+    // Split at doubling scales from the fastest rate up, so no feature is
+    // stepped over; the integral is at least 1/p_min (the rarest item alone).
     let mut cuts: Vec<f64> = vec![0.0];
-    let mut t = 1.0 / probs.iter().copied().fold(0.0, f64::max);
+    let mut t = 1.0 / p_max;
     while t < end {
         cuts.push(t);
         t *= 2.0;
     }
     cuts.push(end);
-    cuts.windows(2)
-        .map(|w| simpson(&f, w[0], w[1], 1e-12, 40))
-        .sum()
+    let scale = 1.0 / p_min;
+    let mut evaluations = 0u64;
+    let mut total = 0.0;
+    for w in cuts.windows(2) {
+        // Each piece gets its share of a relative tolerance by width.
+        let tol = 1e-11 * scale * (w[1] - w[0]) / end;
+        total += simpson(&f, w[0], w[1], tol, &mut evaluations)?;
+    }
+    Some(total)
 }
 
-fn simpson(f: &impl Fn(f64) -> f64, a: f64, b: f64, tol: f64, depth: u32) -> f64 {
+/// Adaptive Simpson on [a, b] to an absolute tolerance, or None past a
+/// budget of function evaluations (shared across calls through `evaluations`).
+fn simpson(
+    f: &impl Fn(f64) -> f64,
+    a: f64,
+    b: f64,
+    tol: f64,
+    evaluations: &mut u64,
+) -> Option<f64> {
+    const BUDGET: u64 = 5_000_000;
     // The recursion carries the interval, its three function values and the
     // running estimate; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
@@ -105,23 +138,52 @@ fn simpson(f: &impl Fn(f64) -> f64, a: f64, b: f64, tol: f64, depth: u32) -> f64
         whole: f64,
         tol: f64,
         depth: u32,
-    ) -> f64 {
+        evaluations: &mut u64,
+    ) -> Option<f64> {
         let m = (a + b) / 2.0;
         let (lm, rm) = ((a + m) / 2.0, (m + b) / 2.0);
         let (flm, frm) = (f(lm), f(rm));
+        *evaluations += 2;
+        if *evaluations > BUDGET {
+            return None;
+        }
         let left = (m - a) / 6.0 * (fa + 4.0 * flm + fm);
         let right = (b - m) / 6.0 * (fm + 4.0 * frm + fb);
         let delta = left + right - whole;
-        if depth == 0 || delta.abs() <= 15.0 * tol {
-            left + right + delta / 15.0
+        if delta.abs() <= 15.0 * tol || depth == 0 {
+            Some(left + right + delta / 15.0)
         } else {
-            step(f, a, m, fa, flm, fm, left, tol / 2.0, depth - 1)
-                + step(f, m, b, fm, frm, fb, right, tol / 2.0, depth - 1)
+            Some(
+                step(
+                    f,
+                    a,
+                    m,
+                    fa,
+                    flm,
+                    fm,
+                    left,
+                    tol / 2.0,
+                    depth - 1,
+                    evaluations,
+                )? + step(
+                    f,
+                    m,
+                    b,
+                    fm,
+                    frm,
+                    fb,
+                    right,
+                    tol / 2.0,
+                    depth - 1,
+                    evaluations,
+                )?,
+            )
         }
     }
     let (fa, fb, fm) = (f(a), f(b), f((a + b) / 2.0));
+    *evaluations += 3;
     let whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
-    step(f, a, b, fa, fm, fb, whole, tol, depth)
+    step(f, a, b, fa, fm, fb, whole, tol, 50, evaluations)
 }
 
 /// P(every one of `items` equally likely items is collected within `draws`
@@ -137,7 +199,7 @@ pub fn coupon_complete_within_equal(items: u32, draws: u64) -> f64 {
             p[k] = p[k] * (k as f64 / n as f64) + p[k - 1] * new_item;
         }
         p[0] = 0.0;
-        if p[n] > 1.0 - 1e-17 {
+        if p[n] >= 1.0 - 1e-15 {
             break;
         }
     }
@@ -145,24 +207,40 @@ pub fn coupon_complete_within_equal(items: u32, draws: u64) -> f64 {
 }
 
 /// The same with item probabilities `probs`, by inclusion-exclusion over the
-/// subsets of missing items: sum_S (-1)^|S| (1 - p(S))^draws. Exponential, so
-/// for at most `MAX_WEIGHTED_BUDGET_ITEMS` items.
+/// subsets of missing items: sum_S (-1)^|S| (1 - p(S))^draws, each term as
+/// exp(draws * ln1p(-p(S))) and the sum compensated (Neumaier). Exponential,
+/// so for at most `MAX_WEIGHTED_BUDGET_ITEMS` items; the absolute error stays
+/// around 2^n * 1e-16, far below what a simulation can see.
 pub fn coupon_complete_within_weighted(probs: &[f64], draws: u64) -> f64 {
     let n = probs.len();
-    let mut total = 0.0;
+    if (draws as usize) < n {
+        return 0.0;
+    }
+    let (mut sum, mut comp) = (0.0f64, 0.0f64);
     for mask in 0u32..(1 << n) {
         let p_s: f64 = (0..n)
             .filter(|i| mask & (1 << i) != 0)
             .map(|i| probs[i])
             .sum();
-        let term = (1.0 - p_s).max(0.0).powf(draws as f64);
-        if mask.count_ones() % 2 == 0 {
-            total += term;
+        let term = if p_s >= 1.0 {
+            0.0
         } else {
-            total -= term;
-        }
+            (draws as f64 * (-p_s).ln_1p()).exp()
+        };
+        let term = if mask.count_ones() % 2 == 0 {
+            term
+        } else {
+            -term
+        };
+        let t = sum + term;
+        comp += if sum.abs() >= term.abs() {
+            (sum - t) + term
+        } else {
+            (term - t) + sum
+        };
+        sum = t;
     }
-    total.clamp(0.0, 1.0)
+    (sum + comp).clamp(0.0, 1.0)
 }
 
 /// Items for which `coupon_complete_within_weighted` stays fast.
@@ -224,10 +302,34 @@ pub fn penney_second_wins(a: &[bool], b: &[bool]) -> f64 {
     for_b / (for_b + for_a)
 }
 
-/// Conway's best reply to `a`: the opposite of a's second flip, then a
-/// without its last flip.
+/// The best reply to `a`: of all sequences of the same length, the one that
+/// most often appears before it (exact odds; on a tie, Conway's reply if it
+/// is among the best, else the first in H-before-T order). For three flips
+/// this is Conway's rule (the opposite of a's second flip, then a without its
+/// last); for four or more it can differ, so every candidate is checked.
 pub fn penney_best_reply(a: &[bool]) -> Vec<bool> {
-    let mut b = vec![!a.get(1).copied().unwrap_or(a[0])];
-    b.extend_from_slice(&a[..a.len() - 1]);
-    b
+    let n = a.len();
+    let conway = {
+        let mut b = vec![!a.get(1).copied().unwrap_or(a[0])];
+        b.extend_from_slice(&a[..n - 1]);
+        b
+    };
+    let candidate =
+        |bits: u32| -> Vec<bool> { (0..n).map(|i| bits & (1 << (n - 1 - i)) == 0).collect() };
+    let mut best: (f64, Vec<bool>) = (-1.0, conway.clone());
+    for bits in 0..(1u32 << n) {
+        let b = candidate(bits);
+        if b == a {
+            continue;
+        }
+        let p = penney_second_wins(a, &b);
+        if p > best.0 + 1e-12 {
+            best = (p, b);
+        }
+    }
+    if conway != a && (penney_second_wins(a, &conway) - best.0).abs() <= 1e-12 {
+        conway
+    } else {
+        best.1
+    }
 }

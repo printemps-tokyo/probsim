@@ -295,7 +295,7 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
         }
         (Paradox::Coupon { items, weights, budget: Some(b) }, Lang::En) => {
             let mean = match weights {
-                Some(w) => exact::coupon_mean_weighted(&w.probs),
+                Some(w) => w.coupon_mean().unwrap_or(f64::NAN),
                 None => exact::coupon_mean_equal(*items),
             };
             t(
@@ -304,7 +304,11 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
                     "A gacha has {items} items{}. How likely are you to collect them all within {b} draws?",
                     if weights.is_some() { " with the rates you gave" } else { ", each equally likely" }
                 ),
-                format!("{b} draws for {items} items sounds like plenty."),
+                if *b < *items as u64 {
+                    format!("{b} draws for {items} items: some items can never come up.")
+                } else {
+                    format!("{b} draws for {items} items sounds like plenty.")
+                },
                 format!("You complete it with probability {}.", pct(p)),
                 format!(
                     "On average {mean:.1} draws are needed, and the spread is wide: the last few items can \
@@ -317,7 +321,7 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
         }
         (Paradox::Coupon { items, weights, budget: Some(b) }, Lang::Ja) => {
             let mean = match weights {
-                Some(w) => exact::coupon_mean_weighted(&w.probs),
+                Some(w) => w.coupon_mean().unwrap_or(f64::NAN),
                 None => exact::coupon_mean_equal(*items),
             };
             t(
@@ -326,7 +330,11 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
                     "全{items}種のガチャ{}で、{b}回以内に全種そろう確率は?",
                     if weights.is_some() { "(排出率は指定どおり)" } else { "(どれも同じ確率)" }
                 ),
-                format!("{items}種に{b}回なら十分そう。"),
+                if *b < *items as u64 {
+                    format!("{items}種に{b}回では、出ない種が必ず残ります。")
+                } else {
+                    format!("{items}種に{b}回なら十分そう。")
+                },
                 format!("{b}回以内にそろう確率は{}です。", pct(p)),
                 format!("そろうまでの平均は{mean:.1}回で、ばらつきも大きく、最後の数種がなかなか出ないことがあります。"),
                 "人",
@@ -415,10 +423,17 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
             "針が線と交わる確率",
         ),
         (Paradox::BaseRate { prevalence, sensitivity, specificity }, lang) => {
-            let (tp, fp) = (
-                (10_000.0 * prevalence * sensitivity).round(),
-                (10_000.0 * (1.0 - prevalence) * (1.0 - specificity)).round(),
-            );
+            // A population large enough that the true positives do not round to 0.
+            let tp_rate = prevalence * sensitivity;
+            let fp_rate = (1.0 - prevalence) * (1.0 - specificity);
+            let mut people = 10_000.0f64;
+            while (people * tp_rate).round() < 1.0 && people < 1e12 {
+                people *= 10.0;
+            }
+            let (tp, fp) = ((people * tp_rate).round(), (people * fp_rate).round());
+            let people_text = crate::output::grouped(people as u64);
+            let low = p < sensitivity * 0.5;
+            let more_false = fp_rate > tp_rate;
             match lang {
                 Lang::En => t(
                     format!("Base rate fallacy (a disease in {} of people)", pct(*prevalence)),
@@ -430,11 +445,18 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
                         pct(1.0 - specificity)
                     ),
                     format!("The test is right about {} of the time, so about that.", pct(*sensitivity)),
-                    format!("Only {}.", pct(p)),
-                    format!(
-                        "The healthy are so many that their false alarms outnumber the true positives: in \
-                         10,000 people, about {tp} sick people and {fp} healthy people test positive."
-                    ),
+                    if low { format!("Only {}.", pct(p)) } else { format!("{}.", pct(p)) },
+                    if more_false {
+                        format!(
+                            "The healthy are so many that their false alarms outnumber the true positives: in \
+                             {people_text} people, about {tp} sick people and {fp} healthy people test positive."
+                        )
+                    } else {
+                        format!(
+                            "What counts is how the positives split: in {people_text} people, about {tp} sick people \
+                             and {fp} healthy people test positive, so a positive is usually right here."
+                        )
+                    },
                     "positive tests",
                     "Person",
                     "sick, given a positive test",
@@ -449,11 +471,18 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
                         pct(1.0 - specificity)
                     ),
                     format!("検査は{}当たるのだから、それくらい。", pct(*sensitivity)),
-                    format!("わずか{}です。", pct(p)),
-                    format!(
-                        "健康な人がずっと多いので、その誤報が本当の陽性を上回ります。1万人なら、陽性になる\
-                         病気の人は約{tp}人、健康な人は約{fp}人です。"
-                    ),
+                    if low { format!("わずか{}です。", pct(p)) } else { format!("{}です。", pct(p)) },
+                    if more_false {
+                        format!(
+                            "健康な人がずっと多いので、その誤報が本当の陽性を上回ります。{people_text}人なら、陽性になる\
+                             病気の人は約{tp}人、健康な人は約{fp}人です。"
+                        )
+                    } else {
+                        format!(
+                            "効くのは陽性の内訳です。{people_text}人なら、陽性になる病気の人は約{tp}人、健康な人は約{fp}人\
+                             なので、この条件では陽性はたいてい本当です。"
+                        )
+                    },
                     "件",
                     "人目",
                     "陽性のとき病気である確率",
@@ -462,7 +491,10 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
         }
         (Paradox::Penney { first, second }, lang) => {
             let (a, b, n) = (coins_text(first), coins_text(second), first.len());
-            let best = coins_text(&exact::penney_best_reply(first));
+            let best_seq = exact::penney_best_reply(first);
+            let best = coins_text(&best_seq);
+            // For one or two flips no reply wins more than half the time.
+            let edge = exact::penney_second_wins(first, &best_seq) > 0.5 + 1e-12;
             let exact = paradox.exact().unwrap_or_default();
             match lang {
                 Lang::En => t(
@@ -474,11 +506,17 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
                     ),
                     format!("Every sequence of {n} flips is equally likely, so it is 50/50."),
                     format!("The second player wins {} of the time ({exact}).", pct(p)),
-                    format!(
-                        "Sequences overlap with themselves and with each other in different ways, so some \
-                         tend to come first. Whatever the first player picks, the second can answer with one \
-                         that wins more often: against {a}, Conway's reply is {best}."
-                    ),
+                    if edge {
+                        format!(
+                            "Sequences overlap with themselves and with each other in different ways, so some \
+                             tend to come first. Whatever the first player picks, the second can answer with one \
+                             that wins more often: against {a}, the best reply is {best}."
+                        )
+                    } else {
+                        "With sequences this short, no reply wins more than half the time; from three flips \
+                         on, the second player can always pick one that does."
+                            .to_string()
+                    },
                     "games",
                     "Game",
                     "the second player wins",
@@ -491,10 +529,16 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
                     ),
                     format!("{n}回分の並びはどれも同じ確率で出るので、五分五分。"),
                     format!("後手が{}の確率で勝ちます({exact})。", pct(p)),
-                    format!(
-                        "並びは自分自身や相手との重なり方が違うため、先に出やすい並びがあります。先手が何を選んでも、\
-                         後手はより勝ちやすい並びを選べます。{a}に対するコンウェイの答えは{best}です。"
-                    ),
+                    if edge {
+                        format!(
+                            "並びは自分自身や相手との重なり方が違うため、先に出やすい並びがあります。先手が何を選んでも、\
+                             後手はより勝ちやすい並びを選べます。{a}に対する最善の答えは{best}です。"
+                        )
+                    } else {
+                        "この短さでは、半分より多く勝てる答えはありません。3回分以上になると、後手は必ずより勝ちやすい\
+                         並びを選べます。"
+                            .to_string()
+                    },
                     "回",
                     "回目",
                     "後手が勝つ確率",

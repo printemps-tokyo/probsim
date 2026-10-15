@@ -335,7 +335,7 @@ fn csv_and_svg_export() {
         .split(',')
         .nth(3)
         .is_some_and(|v| !v.is_empty()));
-    let svg = export::svg(&o, "a < b & \"c\"");
+    let svg = export::svg(&o, "a < b & \"c\"", Lang::En);
     assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
     assert!(svg.contains("a &lt; b &amp; &quot;c&quot;"));
     assert!(
@@ -352,7 +352,122 @@ fn csv_and_svg_export() {
         30,
     );
     assert!(
-        export::svg(&c, "x").contains("<polygon"),
+        export::svg(&c, "x", Lang::En).contains("<polygon"),
         "the coupon band (exact variance) is drawn"
     );
+}
+
+#[test]
+fn texts_follow_the_numbers() {
+    let opt = en(false);
+    // A common disease: the positives are mostly true, and the text says so.
+    let common = simulate(
+        &Paradox::BaseRate {
+            prevalence: 0.5,
+            sensitivity: 0.99,
+            specificity: 0.95,
+        },
+        2_000,
+        1,
+        10,
+    );
+    let t = flat(&report(&common, &opt));
+    assert!(
+        !t.contains("Only") && t.contains("usually right here"),
+        "{t}"
+    );
+    // A very rare disease: enough people that the counts do not round to 0.
+    let rare = simulate(
+        &Paradox::BaseRate {
+            prevalence: 1e-5,
+            sensitivity: 0.99,
+            specificity: 0.95,
+        },
+        2_000,
+        1,
+        10,
+    );
+    assert!(!flat(&report(&rare, &opt)).contains("about 0 sick"));
+    // Two flips: no reply has an edge.
+    let short = simulate(
+        &Paradox::Penney {
+            first: coins("HT").unwrap(),
+            second: coins("TH").unwrap(),
+        },
+        1_000,
+        1,
+        10,
+    );
+    assert!(flat(&report(&short, &opt)).contains("no reply wins more than half the time"));
+    // A budget below the number of items.
+    let b = simulate(
+        &Paradox::Coupon {
+            items: 10,
+            weights: None,
+            budget: Some(5),
+        },
+        100,
+        1,
+        10,
+    );
+    assert!(flat(&report(&b, &opt)).contains("some items can never come up"));
+}
+
+#[test]
+fn a_descending_sweep_spreads_across_the_chart() {
+    let pts = study::sweep(
+        &[5.0, 3.0, 1.0],
+        |v| {
+            Ok(Paradox::Birthday {
+                people: v as u32,
+                days: 30,
+                weights: None,
+            })
+        },
+        500,
+        1,
+    )
+    .unwrap();
+    let t = sweep_report(&pts, "people", &en(true));
+    let plot: Vec<&str> = t.lines().filter(|l| l.contains(" |")).collect();
+    let columns: std::collections::HashSet<usize> = plot
+        .iter()
+        .filter_map(|l| l.split_once('|').and_then(|(_, p)| p.find(['o', '@'])))
+        .collect();
+    assert!(columns.len() >= 2, "{t}");
+}
+
+#[test]
+fn svg_labels_have_enough_digits_and_the_axis_follows_the_language() {
+    let o = simulate(
+        &Paradox::BaseRate {
+            prevalence: 1e-5,
+            sensitivity: 0.99,
+            specificity: 0.95,
+        },
+        20_000,
+        1,
+        30,
+    );
+    let ja = export::svg(&o, "x", Lang::Ja);
+    assert!(ja.contains("試行回数(対数目盛り)"));
+    let labels: Vec<&str> = ja
+        .lines()
+        .filter(|l| l.contains("text-anchor=\"end\""))
+        .collect();
+    let mut texts: Vec<String> = labels
+        .iter()
+        .map(|l| {
+            l.split('>')
+                .nth(1)
+                .unwrap()
+                .split('<')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    let n = texts.len();
+    texts.dedup();
+    assert_eq!(texts.len(), n, "labels are distinct: {texts:?}");
 }

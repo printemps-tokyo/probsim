@@ -381,3 +381,44 @@ fn sweeps_and_coverage() {
     // Averages from too few trials have no interval and are left out.
     assert!(study::coverage(&coupon(3), 10, 5, 1).is_empty());
 }
+
+#[test]
+fn nothing_counted_means_no_interval() {
+    // A disease nobody has and a perfect test: no one tests positive.
+    let p = Paradox::BaseRate {
+        prevalence: 1e-100,
+        sensitivity: 0.99,
+        specificity: 1.0,
+    };
+    let o = simulate(&p, 10, 1, 5);
+    assert_eq!(o.counted, 0);
+    assert_eq!(o.ci95, None);
+    assert_eq!(o.consistent(Z95), None);
+    assert!(
+        study::coverage(&p, 5, 3, 1).is_empty(),
+        "runs with nothing counted are not hits"
+    );
+}
+
+#[test]
+fn sweep_values_stay_in_range_and_errors_name_the_value() {
+    assert_eq!(study::sweep_values(1.5, 3.5, 3, true), vec![2.0, 3.0]);
+    assert_eq!(
+        study::sweep_values(5.0, 1.0, 5, true),
+        vec![5.0, 4.0, 3.0, 2.0, 1.0]
+    );
+    let err = study::sweep(
+        &[1.0, 2.0],
+        |v| {
+            if v > 1.5 {
+                Err("bad".into())
+            } else {
+                Ok(coupon(2))
+            }
+        },
+        10,
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(err, "at 2: bad");
+}

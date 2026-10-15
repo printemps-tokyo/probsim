@@ -21,7 +21,8 @@ probsim: watch probability paradoxes converge, next to their exact answers.
 Usage: probsim <paradox> [options]
        probsim all [options]
        probsim sweep <paradox> --vary NAME --from A --to B [--steps N] [options]
-       probsim coverage <paradox> [--runs N] [options]
+                 (--steps: every whole value when there are under 40, else 21)
+       probsim coverage <paradox> [--runs N (100)] [options]
        probsim play monty-hall [--doors N]
        probsim list
 
@@ -100,9 +101,14 @@ struct Args {
     people: u32,
     days: Option<u32>,
     day_weights: Option<String>,
+    /// The --day-weights file's contents, read once (so a sweep or standard
+    /// input works).
+    day_weights_text: Option<String>,
     items: Option<u32>,
     weights: Option<String>,
     weights_file: Option<String>,
+    /// The --weights-file contents, read once.
+    weights_text: Option<String>,
     budget: Option<u64>,
     candidates: u32,
     skip: Option<u32>,
@@ -196,9 +202,11 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
         people: 23,
         days: None,
         day_weights: None,
+        day_weights_text: None,
         items: None,
         weights: None,
         weights_file: None,
+        weights_text: None,
         budget: None,
         candidates: 100,
         skip: None,
@@ -369,13 +377,15 @@ fn applies(a: &Args, flag: &str) -> bool {
 }
 
 /// Numbers in a list or a file ("1, 1, 0.5" or one per line).
+/// Weights from a list or a file: numbers separated by commas, semicolons
+/// or white space ("1,1,0.5", one per line). Each field is a whole number on
+/// its own, so "1,250" is two weights, never one thousand two hundred fifty.
 fn numbers_from(text: &str) -> Result<Vec<f64>, String> {
-    benford::number_tokens(text)
-        .iter()
-        .map(|t| {
-            t.text
-                .parse::<f64>()
-                .map_err(|_| format!("{:?} is not a number", t.text))
+    text.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            f.parse::<f64>()
+                .map_err(|_| format!("{f:?} is not a number"))
         })
         .collect()
 }
@@ -401,11 +411,15 @@ fn paradox(a: &Args, name: &str) -> Result<Paradox, String> {
             host_knows: !a.random_host,
         },
         "birthday" => {
-            let weights = match &a.day_weights {
-                Some(path) => Some(Arc::new(
-                    Weights::new(&numbers_from(&read_file(path)?)?)
-                        .map_err(|e| format!("--day-weights: {e}"))?,
-                )),
+            let weights = match &a.day_weights_text {
+                Some(text) => {
+                    let w = Weights::new(&numbers_from(text)?)
+                        .map_err(|e| format!("--day-weights: {e}"))?;
+                    if w.len() > 100_000 {
+                        return Err("--day-weights: at most 100,000 days".into());
+                    }
+                    Some(Arc::new(w))
+                }
                 None => None,
             };
             let days = match (&weights, a.days) {
@@ -418,6 +432,12 @@ fn paradox(a: &Args, name: &str) -> Result<Paradox, String> {
                 (Some(w), _) => w.len() as u32,
                 (None, d) => d.unwrap_or(365),
             };
+            if let Some(w) = &weights {
+                let positive = w.probs.iter().filter(|&&p| p > 0.0).count();
+                if (a.people as usize) <= positive && a.people as f64 * w.len() as f64 > 5e8 {
+                    return Err("--people x the number of day weights is too large to compute exactly (at most 500,000,000)".into());
+                }
+            }
             Paradox::Birthday {
                 people: a.people,
                 days,
@@ -430,7 +450,7 @@ fn paradox(a: &Args, name: &str) -> Result<Paradox, String> {
                     return Err("give --weights or --weights-file, not both".into())
                 }
                 (Some(l), None) => Some(numbers_from(l)?),
-                (None, Some(f)) => Some(numbers_from(&read_file(f)?)?),
+                (None, Some(_)) => Some(numbers_from(a.weights_text.as_deref().unwrap_or(""))?),
                 (None, None) => None,
             };
             let weights = match list {
@@ -459,6 +479,9 @@ fn paradox(a: &Args, name: &str) -> Result<Paradox, String> {
                 (None, n) => n.unwrap_or(10),
             };
             let weights = weights.filter(|w| !w.uniform());
+            if a.budget.is_none() && weights.as_ref().is_some_and(|w| w.coupon_mean().is_none()) {
+                return Err("--weights: the exact mean did not converge for these rates".into());
+            }
             if let Some(b) = a.budget {
                 if weights
                     .as_ref()
@@ -679,7 +702,39 @@ fn undecided(what: &str) -> String {
     format!("--check cannot judge {what}: too few trials (an average needs at least 30; benford needs enough numbers)")
 }
 
-fn run(a: Args) -> Result<ExitCode, String> {
+/// Roughly how many basic steps (draws, flips, shuffled candidates) a run
+/// takes, to refuse one that would run for a very long time.
+fn work(p: &Paradox, trials: u64) -> f64 {
+    let per_trial = match p {
+        Paradox::Coupon {
+            budget: Some(b), ..
+        } => *b as f64,
+        Paradox::Coupon { .. } => p.theory(),
+        Paradox::Birthday { people, .. } => *people as f64,
+        Paradox::Secretary { candidates, .. } => *candidates as f64,
+        // The waiting time for a sequence of n flips is at most 2^(n+1).
+        Paradox::Penney { first, .. } => 2f64.powi(first.len() as i32 + 1),
+        _ => 1.0,
+    };
+    per_trial * trials as f64
+}
+
+/// About a minute of simulation on an ordinary machine.
+const MAX_WORK: f64 = 2e10;
+
+fn affordable(p: &Paradox, trials: u64) -> Result<(), String> {
+    let w = work(p, trials);
+    if w > MAX_WORK {
+        let suggest = ((MAX_WORK / (w / trials as f64)).floor() as u64).max(1);
+        return Err(format!(
+            "this would take about {w:.0e} steps; use --trials {} or fewer",
+            probsim::output::grouped(suggest)
+        ));
+    }
+    Ok(())
+}
+
+fn run(mut a: Args) -> Result<ExitCode, String> {
     let lang = a
         .lang
         .unwrap_or_else(|| Lang::from_env(|k| std::env::var(k).ok()));
@@ -694,6 +749,14 @@ fn run(a: Args) -> Result<ExitCode, String> {
             "{f} does not apply to {:?} here; see --help",
             a.command
         ));
+    }
+    // Read weight files once, so every point of a sweep sees the same data
+    // and standard input can be used.
+    if let Some(path) = a.day_weights.clone() {
+        a.day_weights_text = Some(read_file(&path)?);
+    }
+    if let Some(path) = a.weights_file.clone() {
+        a.weights_text = Some(read_file(&path)?);
     }
     if a.json && a.csv {
         return Err("choose --json or --csv, not both".into());
@@ -781,13 +844,15 @@ fn run(a: Args) -> Result<ExitCode, String> {
             let make = |v: f64| -> Result<Paradox, String> {
                 let mut b = a.clone();
                 set_param(&mut b, &name, v)?;
-                paradox(&b, &target)
+                let p = paradox(&b, &target)?;
+                affordable(&p, trials)?;
+                Ok(p)
             };
             let pts = study::sweep(&values, make, trials, seed)?;
             let text = if a.json {
                 sweep_json(&pts, &name, seed) + "\n"
             } else if a.csv {
-                let mut s = format!("{name},exact,estimate,ci_low,ci_high\n");
+                let mut s = format!("{name},exact,estimate,counted,ci_low,ci_high\n");
                 for p in &pts {
                     let (lo, hi) = p
                         .outcome
@@ -795,9 +860,15 @@ fn run(a: Args) -> Result<ExitCode, String> {
                         .map_or((String::new(), String::new()), |(l, h)| {
                             (l.to_string(), h.to_string())
                         });
+                    // No estimate where nothing counted: an empty field, like the interval.
+                    let est = if p.outcome.counted == 0 {
+                        String::new()
+                    } else {
+                        p.outcome.estimate.to_string()
+                    };
                     s += &format!(
-                        "{},{},{},{lo},{hi}\n",
-                        p.value, p.outcome.theory, p.outcome.estimate
+                        "{},{},{est},{},{lo},{hi}\n",
+                        p.value, p.outcome.theory, p.outcome.counted
                     );
                 }
                 s
@@ -823,7 +894,15 @@ fn run(a: Args) -> Result<ExitCode, String> {
             }
             let p = paradox(&a, &target)?;
             let trials = a.trials.unwrap_or(1_000);
+            affordable(&p, trials.saturating_mul(a.runs))?;
             let runs = study::coverage(&p, a.runs, trials, seed);
+            if runs.is_empty() {
+                return Err(format!(
+                    "no run could be judged: {} (an average needs at least 30 trials per run, and a \
+                     conditional question needs some trials that match)",
+                    "too few trials per run"
+                ));
+            }
             let text = if a.json {
                 coverage_json(&p, &runs, a.runs, trials) + "\n"
             } else if a.csv {
@@ -846,12 +925,9 @@ fn run(a: Args) -> Result<ExitCode, String> {
             let mut outcomes = Vec::new();
             for (i, c) in SIMS.iter().enumerate() {
                 // Each paradox gets its own random stream, derived from the seed.
-                outcomes.push(simulate(
-                    &paradox(&a, c)?,
-                    trials,
-                    derived_seed(seed, i as u64),
-                    points,
-                ));
+                let p = paradox(&a, c)?;
+                affordable(&p, trials)?;
+                outcomes.push(simulate(&p, trials, derived_seed(seed, i as u64), points));
             }
             let src = Source::PowersOfTwo(trials);
             let analysis = benford::analyze(src.counts(1), 1);
@@ -902,6 +978,7 @@ fn run(a: Args) -> Result<ExitCode, String> {
         c => {
             let p = paradox(&a, c)?;
             let trials = a.trials.unwrap_or(100_000);
+            affordable(&p, trials)?;
             // --explain replays the first trials of the same seed with their
             // stories; the simulation below repeats them and goes on.
             let mut stories = Vec::new();
@@ -922,7 +999,7 @@ fn run(a: Args) -> Result<ExitCode, String> {
                     p.texts(lang).title,
                     p.texts(lang).quantity
                 );
-                std::fs::write(path, export::svg(&o, &title))
+                std::fs::write(path, export::svg(&o, &title, lang))
                     .map_err(|e| format!("cannot write {path:?}: {e}"))?;
             }
             let text = if a.json {

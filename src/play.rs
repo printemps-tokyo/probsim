@@ -69,8 +69,14 @@ pub fn monty_hall(
     let mut t = Tally::default();
     let n = doors as u64;
     match lang {
-        Lang::En => writeln!(out, "Monty Hall with {doors} doors. Type q to stop.")?,
-        Lang::Ja => writeln!(out, "ドア{doors}枚のモンティ・ホール。qで終了します。")?,
+        Lang::En => writeln!(
+            out,
+            "Monty Hall with {doors} doors (seed {seed}). Type q to stop."
+        )?,
+        Lang::Ja => writeln!(
+            out,
+            "ドア{doors}枚のモンティ・ホール(seed {seed})。qで終了します。"
+        )?,
     }
     'game: loop {
         let car = rng.below(n);
@@ -102,12 +108,12 @@ pub fn monty_hall(
         };
         let prompt = match lang {
             Lang::En => format!(
-                "The host opens every other door but {}: goats. Switch to door {}? (y/n): ",
+                "The host opens the doors other than yours and door {}: all goats. Switch to door {}? (y/n): ",
                 kept + 1,
                 kept + 1
             ),
             Lang::Ja => format!(
-                "司会者はドア{}以外を開けました。すべてヤギです。ドア{}に変えますか?(y/n): ",
+                "司会者は、あなたのドアとドア{}以外を開けました。すべてヤギです。ドア{}に変えますか?(y/n): ",
                 kept + 1,
                 kept + 1
             ),
@@ -117,7 +123,10 @@ pub fn monty_hall(
                 None => break 'game,
                 Some("y" | "yes") => break true,
                 Some("n" | "no") => break false,
-                Some(_) => {}
+                Some(_) => match lang {
+                    Lang::En => writeln!(out, "Type y or n.")?,
+                    Lang::Ja => writeln!(out, "yかnを入力してください。")?,
+                },
             }
         };
         let final_pick = if switch { kept } else { pick };

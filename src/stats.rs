@@ -161,6 +161,13 @@ pub fn chi_square_p(stat: f64, df: u32) -> f64 {
 /// largest with P(X >= k) > (1 - level) / 2), from the probabilities
 /// computed in logs.
 pub fn binomial_central(n: u64, p: f64, level: f64) -> (u64, u64) {
+    // A certain outcome has all its probability on one count.
+    if p <= 0.0 {
+        return (0, 0);
+    }
+    if p >= 1.0 {
+        return (n, n);
+    }
     let tail = (1.0 - level) / 2.0;
     let ln_pmf = |k: u64| {
         ln_gamma(n as f64 + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma((n - k) as f64 + 1.0)

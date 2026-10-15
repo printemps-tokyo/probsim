@@ -130,7 +130,7 @@ error or when `--check` cannot judge.
 | `secretary` | Hire the best candidate, deciding on the spot. Skip the first ~37%, then take the first who beats them all. | `--candidates N` (100), `--skip K` (the best cutoff) |
 | `buffon` | A needle of length l on lines t apart crosses with probability 2l/(pi t), so needles estimate pi. Only l/t matters. | `--length L` (1), `--spacing T` (2), L <= T |
 | `base-rate` | A disease in 1% of people, a test that finds 99% of cases and flags 5% of the healthy: a positive test means sickness only 16.7% of the time. | `--prevalence P` (0.01), `--sensitivity P` (0.99), `--specificity P` (0.95); `5%` works too |
-| `penney` | Two players pick coin sequences; the one whose sequence appears first wins. Whatever the first picks, the second can pick one that wins more often: against HHT, THH wins 3/4. | `--first SEQ` (HHT), `--second SEQ` (Conway's best reply) |
+| `penney` | Two players pick coin sequences; the one whose sequence appears first wins. From three flips on, whatever the first picks, the second can pick one that wins more often: against HHT, THH wins 3/4. | `--first SEQ` (HHT), `--second SEQ` (the best reply, found by checking every sequence) |
 | `boy-girl` | Two children, at least one a boy born on a Tuesday: both boys with probability 13/27; without the Tuesday, 1/3. | `--any-day` |
 | `bertrand` | A random chord is longer than the inscribed triangle's side with probability 1/3, 1/2 or 1/4, depending on how it is drawn. | `--method endpoints\|radius\|midpoint` |
 | `benford` | In data that follows Benford's law, digit d leads with probability log10(1 + 1/d): 30.1% for 1. | `--source powers2\|fibonacci`, `--file PATH` (`-` for standard input), `--column N`, `--delimiter C`, `--digits 1\|2` |
@@ -157,16 +157,26 @@ $ probsim gacha --weights 1,1,1,1,0.2 --seed 1 --no-chart
 ```
 
 With unequal rates the mean comes from the integral of
-1 - prod(1 - e^(-p_i t)) (Flajolet, Gardy and Thimonier, 1992). The chance of
-completing within a budget is exact for equal rates (a Markov chain on the
-number collected) and, by inclusion-exclusion, for up to 20 items with unequal
-rates.
+1 - prod(1 - e^(-p_i t)) (Flajolet, Gardy and Thimonier, 1992), computed
+numerically (adaptive Simpson, to a relative accuracy of about 1e-11). The
+chance of completing within a budget is exact for equal rates (a Markov chain
+on the number collected) and, by inclusion-exclusion, for up to 20 items with
+unequal rates.
+
+`--weights` takes numbers separated by commas, semicolons or spaces, each one
+weight ("500,300,150,50" is four items; no thousands separators). The smallest
+positive weight must be at least 1e-12 of the largest, so that every item can
+actually be drawn. A run that would take very long (expected draws times
+trials beyond about 2e10) is refused with a smaller `--trials` to use.
 
 ### Sweeps
 
 `probsim sweep <paradox> --vary NAME --from A --to B [--steps N]` runs the
 paradox at each value and shows the exact and simulated answers together. Each
-point has its own random stream derived from the seed. Number parameters can
+point has its own random stream derived from the seed. Without `--steps`, a
+whole-number parameter takes every value when there are fewer than 40, and 21
+evenly spaced values otherwise; the range may run downwards. For conditional
+questions the table shows how many trials counted at each point. Number parameters can
 be swept: `doors`, `people`, `days`, `items`, `budget`, `candidates`, `skip`,
 `length`, `spacing`, `prevalence`, `sensitivity`, `specificity`.
 
@@ -206,9 +216,13 @@ seed 1 (each point gets its own stream from it)
 
 ### What 95% confidence means
 
-`probsim coverage <paradox> --runs N` repeats a run with independent seeds and
-draws each 95% interval against the exact answer (`|`). About 95% of them
-contain it; any single one either does or does not.
+`probsim coverage <paradox> --runs N` (100 by default) repeats a run with
+independent seeds and draws each 95% interval against the exact answer (`|`).
+About 95% of them contain it; any single one either does or does not. Runs
+without an interval (an average from fewer than 30 trials, or a conditional
+question where no trial matched) are left out and counted. For an average the
+interval is a normal approximation, so with a skewed result such as gacha
+draws and few trials per run, the share comes out somewhat below 95%.
 
 ```console
 $ probsim coverage monty-hall --runs 12 --trials 300 --seed 5 --width 44

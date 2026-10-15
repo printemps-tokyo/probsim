@@ -9,9 +9,12 @@ use crate::stats::Z95;
 /// `to`, rounded and deduplicated for an integer parameter.
 pub fn sweep_values(from: f64, to: f64, steps: usize, integer: bool) -> Vec<f64> {
     let steps = steps.max(2);
+    let (lo, hi) = (from.min(to), from.max(to));
     let mut v: Vec<f64> = (0..steps)
         .map(|i| from + (to - from) * i as f64 / (steps - 1) as f64)
         .map(|x| if integer { x.round() } else { x })
+        // Rounding must not step outside the range asked for.
+        .filter(|x| (lo..=hi).contains(x))
         .collect();
     v.dedup_by(|a, b| a == b);
     v
@@ -36,7 +39,7 @@ pub fn sweep(
         .iter()
         .enumerate()
         .map(|(i, &value)| {
-            let p = make(value)?;
+            let p = make(value).map_err(|e| format!("at {}: {e}", crate::paradox::num(value)))?;
             Ok(SweepPoint {
                 value,
                 outcome: simulate(&p, trials, derived_seed(seed, i as u64), 2),

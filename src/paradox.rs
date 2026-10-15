@@ -41,12 +41,26 @@ pub enum Measure {
 }
 
 /// Unequal chances (of birthdays on each day, of each gacha item),
-/// normalized, with the running sums for sampling.
-#[derive(Clone, Debug, PartialEq)]
+/// normalized, with the running sums for sampling and a cache for the exact
+/// answers that take a while (the gacha integral, inclusion-exclusion).
+#[derive(Clone, Debug)]
 pub struct Weights {
     pub probs: Vec<f64>,
     cumulative: Vec<f64>,
+    mean: std::sync::OnceLock<Option<f64>>,
+    within: std::sync::OnceLock<(u64, f64)>,
 }
+
+impl PartialEq for Weights {
+    fn eq(&self, other: &Self) -> bool {
+        self.probs == other.probs
+    }
+}
+
+/// The smallest ratio of two positive weights accepted: below it, the rare
+/// item's share of the running sums can vanish in rounding, so it would never
+/// be drawn.
+pub const MIN_WEIGHT_RATIO: f64 = 1e-12;
 
 impl Weights {
     /// From non-negative weights with a positive sum.
@@ -61,16 +75,27 @@ impl Weights {
         if !(total > 0.0 && total.is_finite()) {
             return Err("weights must add up to a positive number".into());
         }
+        let max = raw.iter().copied().fold(0.0, f64::max);
+        if raw.iter().any(|&w| w > 0.0 && w / max < MIN_WEIGHT_RATIO) {
+            return Err(format!(
+                "weights are too uneven: the smallest positive one must be at least {MIN_WEIGHT_RATIO:e} of the largest"
+            ));
+        }
         let probs: Vec<f64> = raw.iter().map(|w| w / total).collect();
         let mut acc = 0.0;
-        let cumulative = probs
+        let cumulative: Vec<f64> = probs
             .iter()
             .map(|p| {
                 acc += p;
                 acc
             })
             .collect();
-        Ok(Weights { probs, cumulative })
+        Ok(Weights {
+            probs,
+            cumulative,
+            mean: Default::default(),
+            within: Default::default(),
+        })
     }
 
     /// An index drawn with these chances (binary search on the running sums).
@@ -98,6 +123,30 @@ impl Weights {
     pub fn uniform(&self) -> bool {
         let first = self.probs[0];
         self.probs.iter().all(|&p| (p - first).abs() <= 1e-15)
+    }
+
+    /// The expected draws to collect every item, computed once (None if the
+    /// integral did not converge).
+    pub fn coupon_mean(&self) -> Option<f64> {
+        *self
+            .mean
+            .get_or_init(|| exact::coupon_mean_weighted(&self.probs))
+    }
+
+    /// The chance of collecting every item within `draws`, cached for the
+    /// first budget asked.
+    pub fn complete_within(&self, draws: u64) -> f64 {
+        let &(b, p) = self.within.get_or_init(|| {
+            (
+                draws,
+                exact::coupon_complete_within_weighted(&self.probs, draws),
+            )
+        });
+        if b == draws {
+            p
+        } else {
+            exact::coupon_complete_within_weighted(&self.probs, draws)
+        }
     }
 }
 
@@ -290,9 +339,9 @@ impl Paradox {
                 budget,
             } => match (weights, budget) {
                 (None, None) => exact::coupon_mean_equal(*items),
-                (Some(w), None) => exact::coupon_mean_weighted(&w.probs),
+                (Some(w), None) => w.coupon_mean().unwrap_or(f64::NAN),
                 (None, Some(b)) => exact::coupon_complete_within_equal(*items, *b),
-                (Some(w), Some(b)) => exact::coupon_complete_within_weighted(&w.probs, *b),
+                (Some(w), Some(b)) => w.complete_within(*b),
             },
             Paradox::Secretary { candidates, skip } => exact::secretary_success(*candidates, *skip),
             Paradox::Buffon { length, spacing } => 2.0 * (length / spacing) / std::f64::consts::PI,

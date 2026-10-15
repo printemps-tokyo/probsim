@@ -795,12 +795,23 @@ pub fn sweep_report(points: &[crate::study::SweepPoint], name: &str, opt: &TextO
         Lang::En => ("exact", "simulated", "95% CI"),
         Lang::Ja => ("正解", "結果", "95%信頼区間"),
     };
+    // Conditional questions count only the matching trials: show how many.
+    let conditional = first.outcome.paradox.may_reject();
+    let h_counted = match opt.lang {
+        Lang::En => "counted",
+        Lang::Ja => "数えた回数",
+    };
     let _ = writeln!(
         s,
-        "  {}  {}  {}  {}",
+        "  {}  {}  {}{}  {}",
         pad_left(name, 10),
         pad_left(h_exact, 10),
         pad_left(h_sim, 10),
+        if conditional {
+            format!("  {}", pad_left(h_counted, 10))
+        } else {
+            String::new()
+        },
         h_ci
     );
     for p in points {
@@ -808,12 +819,22 @@ pub fn sweep_report(points: &[crate::study::SweepPoint], name: &str, opt: &TextO
         let ci = o.ci95.map_or("-".to_string(), |(lo, hi)| {
             format!("[{}, {}]", value(m, lo), value(m, hi))
         });
+        let est = if o.counted == 0 {
+            "-".to_string()
+        } else {
+            value(m, o.estimate)
+        };
         let _ = writeln!(
             s,
-            "  {:>10}  {:>10}  {:>10}  {}",
+            "  {:>10}  {:>10}  {:>10}{}  {}",
             crate::paradox::num(p.value),
             value(m, o.theory),
-            value(m, o.estimate),
+            est,
+            if conditional {
+                format!("  {:>10}", grouped(o.counted))
+            } else {
+                String::new()
+            },
             ci
         );
     }
@@ -843,7 +864,13 @@ fn sweep_chart(
     let width = width.max(10);
     let ys: Vec<f64> = points
         .iter()
-        .flat_map(|p| [p.outcome.theory, p.outcome.estimate])
+        .flat_map(|p| {
+            let mut v = vec![p.outcome.theory];
+            if p.outcome.counted > 0 {
+                v.push(p.outcome.estimate);
+            }
+            v
+        })
         .collect();
     let (mut lo, mut hi) = (
         ys.iter().copied().fold(f64::INFINITY, f64::min),
@@ -859,7 +886,8 @@ fn sweep_chart(
     }
     let (x0, x1) = (points[0].value, points[points.len() - 1].value);
     let col = |x: f64| {
-        if x1 > x0 {
+        // Works both ways, so a sweep from a high value down is drawn too.
+        if x1 != x0 {
             (((x - x0) / (x1 - x0)) * (width - 1) as f64).round() as usize
         } else {
             0
@@ -873,9 +901,13 @@ fn sweep_chart(
     let mut grid = vec![vec![' '; width]; height];
     for p in points {
         let c = col(p.value).min(width - 1);
-        let (re, rs) = (row(p.outcome.theory), row(p.outcome.estimate));
+        let re = row(p.outcome.theory);
         grid[re][c] = 'o';
-        grid[rs][c] = if rs == re { '@' } else { '*' };
+        // A point where no trial counted has no estimate to draw.
+        if p.outcome.counted > 0 {
+            let rs = row(p.outcome.estimate);
+            grid[rs][c] = if rs == re { '@' } else { '*' };
+        }
     }
     let lw = value(m, hi).len().max(value(m, lo).len());
     let mut out: Vec<String> = (0..height)
@@ -1017,7 +1049,7 @@ pub fn coverage_report(
                 &format!(
                     "{judged}個の区間のうち{hits}個({})が正解を含みました。95%信頼区間とは、約95%の実行で正解を\
                      とらえる方法のことで、1つ1つの区間は正解を含むか含まないかのどちらかです(この回数なら、\
-                     正しい95%の方法でも、この回数なら当たる割合はおよそ{}から{}の間でばらつきます)。",
+                     正しい95%の方法でも当たる割合はおよそ{}から{}の間でばらつきます)。",
                     crate::paradox::pct(share),
                     crate::paradox::pct(expected_lo.0),
                     crate::paradox::pct(expected_lo.1)
@@ -1027,16 +1059,27 @@ pub fn coverage_report(
             )
         ),
     };
+    if m == Measure::Mean {
+        let note = match opt.lang {
+            Lang::En => "For an average the interval is a normal approximation; with a skewed result (like \
+                         gacha draws) and few trials per run, it catches the answer somewhat less often than 95%."
+                .to_string(),
+            Lang::Ja => "平均の区間は正規近似です。ガチャの回数のように偏った分布で1回あたりの試行が少ないと、\
+                         正解をとらえる割合は95%よりやや低くなります。"
+                .to_string(),
+        };
+        let _ = writeln!(s, "{}", wrap(&note, WRAP, 0));
+    }
     if (judged as u64) < asked {
         let _ = match opt.lang {
             Lang::En => writeln!(
                 s,
-                "{} runs had too few trials for an interval and were left out.",
+                "{} runs had no interval (too few trials, or none that matched the condition) and were left out.",
                 asked - judged as u64
             ),
             Lang::Ja => writeln!(
                 s,
-                "{}回は試行が少なく区間が出せないため除きました。",
+                "{}回は区間が出せない(試行が少ない、または条件に合う試行がない)ため除きました。",
                 asked - judged as u64
             ),
         };

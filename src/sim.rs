@@ -39,6 +39,10 @@ impl Outcome {
     /// The interval at confidence z: Wilson for a probability, normal for an
     /// average (None below `stats::MIN_FOR_MEAN` trials).
     pub fn interval(&self, z: f64) -> Option<(f64, f64)> {
+        if self.counted == 0 {
+            // Nothing to estimate from (no trial matched the condition).
+            return None;
+        }
         match self.paradox.measure() {
             Measure::Probability => Some(wilson(self.successes, self.counted, z)),
             Measure::Mean => normal_interval(&self.running, z),

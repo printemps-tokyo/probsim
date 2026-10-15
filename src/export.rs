@@ -42,7 +42,7 @@ fn xml(s: &str) -> String {
 
 /// The convergence chart as a standalone SVG: the running estimate on a log
 /// scale of trials, the exact answer, and the band where it holds.
-pub fn svg(o: &Outcome, title: &str) -> String {
+pub fn svg(o: &Outcome, title: &str, lang: crate::paradox::Lang) -> String {
     let (w, h) = (720.0, 400.0);
     let (left, right, top, bottom) = (70.0, 20.0, 40.0, 50.0);
     let pts = &o.checkpoints;
@@ -132,21 +132,22 @@ pub fn svg(o: &Outcome, title: &str) -> String {
         h - bottom,
         w - right
     );
-    let fmt = |v: f64| {
-        if o.paradox.measure() == Measure::Probability {
-            format!("{v:.4}")
-        } else {
-            format!("{v:.2}")
-        }
-    };
+    // Enough decimals to tell the labels apart, even for a tiny probability.
+    let decimals = ((-(ymax - ymin).log10()).ceil() as i64 + 2).clamp(2, 12) as usize;
+    let mut shown: Vec<String> = Vec::new();
     for v in [ymax, o.theory, ymin] {
+        let label = format!("{v:.decimals$}");
+        if shown.contains(&label) {
+            continue;
+        }
         let _ = writeln!(
             s,
             "<text x=\"{}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"#444\">{}</text>",
             left - 6.0,
             y(v) + 4.0,
-            fmt(v)
+            label
         );
+        shown.push(label);
     }
     let mut n = 1u64;
     while (n as f64) <= n1 {
@@ -166,9 +167,13 @@ pub fn svg(o: &Outcome, title: &str) -> String {
     }
     let _ = writeln!(
         s,
-        "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" fill=\"#444\">trials (log scale)</text>",
+        "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" fill=\"#444\">{}</text>",
         (left + w - right) / 2.0,
-        h - 10.0
+        h - 10.0,
+        match lang {
+            crate::paradox::Lang::En => "trials (log scale)",
+            crate::paradox::Lang::Ja => "試行回数(対数目盛り)",
+        }
     );
     s.push_str("</svg>\n");
     s

@@ -200,7 +200,7 @@ fn sweep_coverage_csv_and_svg() {
         "--csv",
     ]);
     assert!(
-        csv.starts_with("skip,exact,estimate,ci_low,ci_high\n0,0.01,"),
+        csv.starts_with("skip,exact,estimate,counted,ci_low,ci_high\n0,0.01,"),
         "{csv}"
     );
     assert_eq!(csv.lines().count(), 5);
@@ -342,4 +342,92 @@ fn japanese_output() {
     assert!(out.starts_with("秘書問題(100人の候補者)"));
     let (_, bg, _) = probsim(&["boy-girl", "--trials", "3000", "--lang", "ja", "--no-chart"]);
     assert!(bg.starts_with("男女の謎(火曜日生まれの男の子)"));
+}
+
+#[test]
+fn weights_lists_are_read_field_by_field() {
+    let (code, out, _) = probsim(&[
+        "gacha",
+        "--weights",
+        "500,300,150,50",
+        "--trials",
+        "100",
+        "--json",
+    ]);
+    assert_eq!(code, 0);
+    assert!(out.contains("\"items\":4"), "{out}");
+    let (_, b, _) = probsim(&[
+        "gacha",
+        "--weights",
+        "1,100",
+        "--budget",
+        "2",
+        "--trials",
+        "100",
+        "--json",
+    ]);
+    assert!(b.contains("\"items\":2"), "{b}");
+    for bad in ["1,NaN", "1,-.5", "1,x"] {
+        assert_eq!(probsim(&["gacha", "--weights", bad]).0, 2, "{bad}");
+    }
+}
+
+#[test]
+fn guards_against_runs_that_would_take_too_long() {
+    let (code, _, err) = probsim(&["gacha", "--weights", "1,1e-6"]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("use --trials") && err.contains("or fewer"),
+        "{err}"
+    );
+    let (code, _, err) = probsim(&[
+        "coverage",
+        "base-rate",
+        "--prevalence",
+        "1e-100",
+        "--specificity",
+        "1",
+        "--runs",
+        "3",
+        "--trials",
+        "1",
+    ]);
+    assert_eq!(code, 2);
+    assert!(err.contains("no run could be judged"), "{err}");
+}
+
+#[test]
+fn a_sweep_reads_standard_input_once() {
+    let (code, out, err) = run(
+        &[
+            "sweep",
+            "birthday",
+            "--vary",
+            "people",
+            "--from",
+            "1",
+            "--to",
+            "2",
+            "--day-weights",
+            "-",
+            "--trials",
+            "10",
+            "--json",
+        ],
+        Some(b"1\n2\n"),
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("\"value\":2"), "{out}");
+}
+
+#[test]
+fn play_explains_bad_answers_and_prints_the_seed() {
+    let (_, out, _) = run(
+        &["play", "monty-hall", "--seed", "4"],
+        Some(b"1\nmaybe\ny\nq\n"),
+    );
+    assert!(
+        out.contains("(seed 4)") && out.contains("Type y or n."),
+        "{out}"
+    );
 }

@@ -300,7 +300,7 @@ fn gacha_exact_answers() {
         let p = vec![1.0 / n as f64; n as usize];
         assert!(
             close(
-                exact::coupon_mean_weighted(&p),
+                exact::coupon_mean_weighted(&p).unwrap(),
                 exact::coupon_mean_equal(n),
                 1e-7 * n as f64
             ),
@@ -310,7 +310,7 @@ fn gacha_exact_answers() {
     // Two items with p and q: E = 1/p + 1/q - 1/(p + q) (inclusion-exclusion).
     let (p, q) = (0.9, 0.1);
     assert!(close(
-        exact::coupon_mean_weighted(&[p, q]),
+        exact::coupon_mean_weighted(&[p, q]).unwrap(),
         1.0 / p + 1.0 / q - 1.0,
         1e-8
     ));
@@ -494,4 +494,78 @@ fn benford_tests_and_mad() {
         Source::Fibonacci(500).counts(1),
         count_digits(&fibonacci(500))
     );
+}
+
+#[test]
+fn gacha_numerics_hold_up_at_the_extremes() {
+    use std::time::Instant;
+    // Extreme ratios and many items converge quickly to the exact mean.
+    let t = Instant::now();
+    for q in [1e-3, 1e-6, 1e-9, 1e-12] {
+        let (a, b) = (1.0 / (1.0 + q), q / (1.0 + q));
+        let want = 1.0 / a + 1.0 / b - 1.0;
+        let got = exact::coupon_mean_weighted(&[a, b]).unwrap();
+        assert!(((got - want) / want).abs() < 1e-8, "q={q}: {got} vs {want}");
+    }
+    let mut r = Rng::new(1);
+    let raw: Vec<f64> = (0..3000).map(|_| 0.5 + r.f64()).collect();
+    let w = Weights::new(&raw).unwrap();
+    assert!(w.coupon_mean().is_some());
+    assert!(t.elapsed().as_secs() < 20, "took {:?}", t.elapsed());
+    // A budget below the number of items is 0 exactly, and tiny chances keep
+    // their precision: two items with chances 1 - q and q within 100 draws.
+    let probs: Vec<f64> = std::iter::repeat_n(1.0 / 20.0, 20).collect();
+    assert_eq!(exact::coupon_complete_within_weighted(&probs, 19), 0.0);
+    let q: f64 = 1e-9 / (1.0 + 1e-9);
+    let want = -(100.0 * (-q).ln_1p()).exp_m1() - q.powi(100);
+    let got = exact::coupon_complete_within_weighted(&[1.0 - q, q], 100);
+    assert!(((got - want) / want).abs() < 1e-6, "{got} vs {want}");
+    // Weights too uneven to sample are refused.
+    assert!(Weights::new(&[1.0, 1e-13]).is_err());
+    assert!(Weights::new(&[1.0, 1e-12]).is_ok());
+}
+
+#[test]
+fn penney_best_reply_is_the_best_for_every_length() {
+    for n in 1..=5usize {
+        for bits in 0..(1u32 << n) {
+            let a: Vec<bool> = (0..n).map(|i| bits & (1 << i) != 0).collect();
+            let reply = exact::penney_best_reply(&a);
+            assert_ne!(reply, a);
+            let best = exact::penney_second_wins(&a, &reply);
+            for other in 0..(1u32 << n) {
+                let b: Vec<bool> = (0..n).map(|i| other & (1 << i) != 0).collect();
+                if b != a {
+                    assert!(
+                        exact::penney_second_wins(&a, &b) <= best + 1e-12,
+                        "{a:?} vs {b:?}"
+                    );
+                }
+            }
+            if n >= 3 {
+                assert!(
+                    best > 0.5,
+                    "from three flips on the second player has an edge: {a:?}"
+                );
+            }
+        }
+    }
+    // Against HTHH the best reply is THTH (9/14), not Conway's three-flip rule (HHTH, 3/5).
+    let a = coins("HTHH").unwrap();
+    assert_eq!(
+        probsim::paradox::coins_text(&exact::penney_best_reply(&a)),
+        "THTH"
+    );
+    assert!(close(
+        exact::penney_second_wins(&a, &coins("THTH").unwrap()),
+        9.0 / 14.0,
+        1e-12
+    ));
+}
+
+#[test]
+fn degenerate_binomials() {
+    assert_eq!(binomial_central(20, 0.0, 0.95), (0, 0));
+    assert_eq!(binomial_central(20, 1.0, 0.95), (20, 20));
+    assert_eq!(binomial_central(0, 0.5, 0.95), (0, 0));
 }
