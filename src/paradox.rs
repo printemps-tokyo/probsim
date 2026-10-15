@@ -49,6 +49,7 @@ pub struct Weights {
     cumulative: Vec<f64>,
     mean: std::sync::OnceLock<Option<f64>>,
     within: std::sync::OnceLock<(u64, f64)>,
+    shared: std::sync::OnceLock<(u32, f64)>,
 }
 
 impl PartialEq for Weights {
@@ -95,6 +96,7 @@ impl Weights {
             cumulative,
             mean: Default::default(),
             within: Default::default(),
+            shared: Default::default(),
         })
     }
 
@@ -133,6 +135,22 @@ impl Weights {
             .get_or_init(|| exact::coupon_mean_weighted(&self.probs))
     }
 
+    /// P(a shared birthday among `people`) with these day chances, cached for
+    /// the first group size asked.
+    pub fn birthday(&self, people: u32) -> f64 {
+        let &(n, p) = self.shared.get_or_init(|| {
+            (
+                people,
+                exact::birthday_probability_weighted(people, &self.probs),
+            )
+        });
+        if n == people {
+            p
+        } else {
+            exact::birthday_probability_weighted(people, &self.probs)
+        }
+    }
+
     /// The chance of collecting every item within `draws`, cached for the
     /// first budget asked.
     pub fn complete_within(&self, draws: u64) -> f64 {
@@ -147,6 +165,43 @@ impl Weights {
         } else {
             exact::coupon_complete_within_weighted(&self.probs, draws)
         }
+    }
+}
+
+/// The equal-rate chance of completing within a budget, remembered per
+/// (items, budget) on this thread: the Markov chain costs items x budget, and
+/// a report asks for the exact answer more than once.
+fn complete_within_equal_cached(items: u32, draws: u64) -> f64 {
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<(u32, u64), f64>> = Default::default();
+    }
+    MEMO.with(|m| {
+        *m.borrow_mut()
+            .entry((items, draws))
+            .or_insert_with(|| exact::coupon_complete_within_equal(items, draws))
+    })
+}
+
+/// Roughly how many basic steps computing the exact answer takes, so that
+/// cost guards can count it too.
+pub fn theory_cost(p: &Paradox) -> f64 {
+    match p {
+        Paradox::Coupon {
+            items,
+            weights: None,
+            budget: Some(b),
+        } => *items as f64 * *b as f64,
+        Paradox::Coupon {
+            weights: Some(w),
+            budget: Some(_),
+            ..
+        } => (1u64 << w.len()) as f64 * w.len() as f64,
+        Paradox::Birthday {
+            people,
+            weights: Some(w),
+            ..
+        } => *people as f64 * w.len() as f64,
+        _ => 0.0,
     }
 }
 
@@ -330,7 +385,7 @@ impl Paradox {
                 days,
                 weights,
             } => match weights {
-                Some(w) => exact::birthday_probability_weighted(*people, &w.probs),
+                Some(w) => w.birthday(*people),
                 None => exact::birthday_probability(*people, *days),
             },
             Paradox::Coupon {
@@ -340,7 +395,7 @@ impl Paradox {
             } => match (weights, budget) {
                 (None, None) => exact::coupon_mean_equal(*items),
                 (Some(w), None) => w.coupon_mean().unwrap_or(f64::NAN),
-                (None, Some(b)) => exact::coupon_complete_within_equal(*items, *b),
+                (None, Some(b)) => complete_within_equal_cached(*items, *b),
                 (Some(w), Some(b)) => w.complete_within(*b),
             },
             Paradox::Secretary { candidates, skip } => exact::secretary_success(*candidates, *skip),
@@ -618,8 +673,20 @@ impl Paradox {
                 weights,
                 budget,
             } => {
-                scratch.clear();
-                scratch.resize(*items as usize, 0);
+                // Generation stamps, as for birthdays: scratch[i] is the
+                // collector that last found item i, scratch[items] the
+                // current one, so the items are not cleared on every trial.
+                let n_items = *items as usize;
+                if scratch.len() != n_items + 1 {
+                    scratch.clear();
+                    scratch.resize(n_items + 1, 0);
+                }
+                let mut generation = scratch[n_items].wrapping_add(1);
+                if generation == 0 {
+                    scratch.iter_mut().for_each(|x| *x = 0);
+                    generation = 1;
+                }
+                scratch[n_items] = generation;
                 let (mut missing, mut draws) = (*items, 0u64);
                 let mut seen: Vec<u64> = Vec::new();
                 let mut last = 0;
@@ -632,8 +699,8 @@ impl Paradox {
                     if story.is_some() && seen.len() < 40 {
                         seen.push(i as u64 + 1);
                     }
-                    if scratch[i] == 0 {
-                        scratch[i] = 1;
+                    if scratch[i] != generation {
+                        scratch[i] = generation;
                         missing -= 1;
                         last = i + 1;
                     }

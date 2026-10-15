@@ -726,7 +726,7 @@ fn work(p: &Paradox, trials: u64) -> f64 {
         Paradox::Penney { first, .. } => 2f64.powi(first.len() as i32 + 1),
         _ => 1.0,
     };
-    per_trial * trials as f64
+    per_trial * trials as f64 + probsim::paradox::theory_cost(p)
 }
 
 /// About a minute of simulation on an ordinary machine.

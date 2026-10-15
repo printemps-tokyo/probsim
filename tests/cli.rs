@@ -501,9 +501,34 @@ fn round_two_edge_cases() {
 #[test]
 fn a_sweep_is_costed_as_a_whole() {
     let (code, _, err) = probsim(&[
-        "sweep", "secretary", "--vary", "skip", "--from", "0", "--to", "99999", "--steps", "200", "--candidates",
-        "100000", "--trials", "200000",
+        "sweep",
+        "secretary",
+        "--vary",
+        "skip",
+        "--from",
+        "0",
+        "--to",
+        "99999",
+        "--steps",
+        "200",
+        "--candidates",
+        "100000",
+        "--trials",
+        "200000",
     ]);
     assert_eq!(code, 2);
-    assert!(err.contains("this sweep would take about") && err.contains("per point"), "{err}");
+    assert!(
+        err.contains("this sweep would take about") && err.contains("per point"),
+        "{err}"
+    );
+}
+
+#[test]
+fn the_exact_answer_counts_toward_the_cost() {
+    let (code, _, err) = probsim(&[
+        "sweep", "coupon", "--vary", "budget", "--from", "40000", "--to", "50000", "--steps", "200", "--items", "10000",
+        "--trials", "1", "--json",
+    ]);
+    assert_eq!(code, 2);
+    assert!(err.contains("this sweep would take about"), "{err}");
 }
