@@ -1,9 +1,13 @@
-//! The paradoxes: what each one asks, its exact answer, and one random trial.
+//! The paradoxes: their parameters, exact answers and one random trial.
+//! The words around them are in `texts`, the longer exact answers in `exact`.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
+use crate::exact;
+pub use crate::exact::{birthday_probability, secretary_best_skip, secretary_success};
 use crate::rng::Rng;
-use crate::stats::harmonic;
+pub use crate::texts::{num, pct, Texts};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
@@ -36,33 +40,123 @@ pub enum Measure {
     Mean,
 }
 
-/// The words around a result.
-pub struct Texts {
-    pub title: String,
-    pub question: String,
-    pub intuition: String,
-    pub truth: String,
-    pub why: String,
-    /// What one trial is called, plural ("games", "groups").
-    pub unit: String,
-    /// What one trial is called, singular, for --explain ("Game", "Group").
-    pub one: String,
-    /// What the estimate is ("switching wins").
-    pub quantity: String,
+/// Unequal chances (of birthdays on each day, of each gacha item),
+/// normalized, with the running sums for sampling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Weights {
+    pub probs: Vec<f64>,
+    cumulative: Vec<f64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+impl Weights {
+    /// From non-negative weights with a positive sum.
+    pub fn new(raw: &[f64]) -> Result<Weights, String> {
+        if raw.is_empty() {
+            return Err("no weights given".into());
+        }
+        if raw.iter().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err("weights must be non-negative numbers".into());
+        }
+        let total: f64 = raw.iter().sum();
+        if !(total > 0.0 && total.is_finite()) {
+            return Err("weights must add up to a positive number".into());
+        }
+        let probs: Vec<f64> = raw.iter().map(|w| w / total).collect();
+        let mut acc = 0.0;
+        let cumulative = probs
+            .iter()
+            .map(|p| {
+                acc += p;
+                acc
+            })
+            .collect();
+        Ok(Weights { probs, cumulative })
+    }
+
+    /// An index drawn with these chances (binary search on the running sums).
+    pub fn sample(&self, rng: &mut Rng) -> usize {
+        let u = rng.f64();
+        let i = self.cumulative.partition_point(|&c| c <= u);
+        // Rounding can leave the last sum a hair under 1; never return an
+        // index with no chance, and never run past the end.
+        let mut i = i.min(self.probs.len() - 1);
+        while self.probs[i] == 0.0 && i > 0 {
+            i -= 1;
+        }
+        i
+    }
+
+    pub fn len(&self) -> usize {
+        self.probs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.probs.is_empty()
+    }
+
+    /// Whether all chances are equal.
+    pub fn uniform(&self) -> bool {
+        let first = self.probs[0];
+        self.probs.iter().all(|&p| (p - first).abs() <= 1e-15)
+    }
+}
+
+/// How a "random chord" is drawn, in Bertrand's paradox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chord {
+    /// Two random points on the circle.
+    Endpoints,
+    /// A random point on a random radius, the chord at right angles to it.
+    Radius,
+    /// A random point in the disk as the chord's midpoint.
+    Midpoint,
+}
+
+impl Chord {
+    pub fn name(self) -> &'static str {
+        match self {
+            Chord::Endpoints => "endpoints",
+            Chord::Radius => "radius",
+            Chord::Midpoint => "midpoint",
+        }
+    }
+}
+
+/// A sequence of coin flips for Penney's game, true for heads.
+pub fn coins(s: &str) -> Result<Vec<bool>, String> {
+    if s.is_empty() || s.len() > 12 {
+        return Err("a coin sequence is 1 to 12 flips of H and T".into());
+    }
+    s.chars()
+        .map(|c| match c.to_ascii_uppercase() {
+            'H' => Ok(true),
+            'T' => Ok(false),
+            _ => Err(format!("{s:?}: use H and T only")),
+        })
+        .collect()
+}
+
+pub fn coins_text(c: &[bool]) -> String {
+    c.iter().map(|&h| if h { 'H' } else { 'T' }).collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Paradox {
     MontyHall {
         doors: u32,
         host_knows: bool,
     },
+    /// With `weights`, `days` is their number.
     Birthday {
         people: u32,
         days: u32,
+        weights: Option<Arc<Weights>>,
     },
+    /// With `budget`, the question is the chance of completing within it.
     Coupon {
         items: u32,
+        weights: Option<Arc<Weights>>,
+        budget: Option<u64>,
     },
     Secretary {
         candidates: u32,
@@ -73,99 +167,68 @@ pub enum Paradox {
         length: f64,
         spacing: f64,
     },
-}
-
-/// Success probability of the secretary rule "reject the first `skip`, then
-/// take the first who beats them all" with `n` candidates:
-/// (k/n) * sum_{j=k}^{n-1} 1/j for k >= 1, and 1/n for k = 0.
-pub fn secretary_success(n: u32, skip: u32) -> f64 {
-    let n_f = n as f64;
-    if skip == 0 {
-        return 1.0 / n_f;
-    }
-    if skip >= n {
-        return 0.0;
-    }
-    let tail: f64 = (skip..n).rev().map(|j| 1.0 / j as f64).sum();
-    skip as f64 / n_f * tail
-}
-
-/// The cutoff that maximizes `secretary_success`, in one pass: the tail sum
-/// is built from the top down. On a tie (within rounding) the smaller cutoff
-/// wins, so for two candidates it is 0.
-pub fn secretary_best_skip(n: u32) -> u32 {
-    const TIE: f64 = 1e-15;
-    let mut best: Option<(u32, f64)> = None;
-    let mut tail = 0.0;
-    for k in (1..n).rev() {
-        tail += 1.0 / k as f64;
-        let p = k as f64 / n as f64 * tail;
-        // Going down, a later k is smaller, so it takes a tie.
-        if best.is_none_or(|(_, b)| p >= b - TIE) {
-            best = Some((k, p));
-        }
-    }
-    match best {
-        Some((k, p)) if p > 1.0 / n as f64 + TIE => k,
-        _ => 0,
-    }
-}
-
-/// P(at least two of `people` share a birthday) with `days` equally likely days.
-pub fn birthday_probability(people: u32, days: u32) -> f64 {
-    if people > days {
-        return 1.0;
-    }
-    let mut all_different = 1.0;
-    for k in 0..people {
-        all_different *= (days - k) as f64 / days as f64;
-    }
-    1.0 - all_different
-}
-
-/// A percentage with enough decimals to show a small value.
-pub fn pct(p: f64) -> String {
-    let v = p * 100.0;
-    if v == 0.0 || v >= 0.1 {
-        format!("{v:.1}%")
-    } else {
-        let decimals = ((-v.log10()).ceil() as usize + 1).clamp(2, 12);
-        format!("{v:.decimals$}%")
-    }
-}
-
-/// A parameter for text: plain for ordinary sizes, scientific otherwise.
-pub fn num(x: f64) -> String {
-    let a = x.abs();
-    if a == 0.0 || (1e-4..1e6).contains(&a) {
-        format!("{x}")
-    } else {
-        format!("{x:e}")
-    }
-}
-
-/// Pairs among `people`, in words.
-fn pairs(people: u32, lang: Lang) -> String {
-    let p = people as u64 * (people as u64).saturating_sub(1) / 2;
-    match (lang, people) {
-        (Lang::En, 1) => "a single person makes no pairs".to_string(),
-        (Lang::En, _) => format!("{people} people make {p} pairs, and any pair can match"),
-        (Lang::Ja, 1) => "1人では組ができません".to_string(),
-        (Lang::Ja, _) => format!("{people}人なら{p}組あり、どの組でも一致しえます"),
-    }
-}
-
-/// "another door, a goat" or "N other doors, all goats".
-fn others(k: u32) -> String {
-    if k == 1 {
-        "another door, a goat".to_string()
-    } else {
-        format!("{k} other doors, all goats")
-    }
+    BaseRate {
+        prevalence: f64,
+        sensitivity: f64,
+        specificity: f64,
+    },
+    Penney {
+        first: Vec<bool>,
+        second: Vec<bool>,
+    },
+    /// Two children; at least one is a boy (born on a Tuesday, if `tuesday`).
+    BoyGirl {
+        tuesday: bool,
+    },
+    Bertrand {
+        method: Chord,
+    },
 }
 
 /// The story of one trial, for --explain: a buffer and its language.
 pub type Story<'a> = Option<(&'a mut String, Lang)>;
+
+/// A uniform direction without using pi: a uniform point in the square kept
+/// when it falls in the unit disk, scaled to length 1.
+fn direction(rng: &mut Rng) -> (f64, f64) {
+    loop {
+        let (x, y) = (2.0 * rng.f64() - 1.0, 2.0 * rng.f64() - 1.0);
+        let r2 = x * x + y * y;
+        if r2 > 0.0 && r2 <= 1.0 {
+            let r = r2.sqrt();
+            return (x / r, y / r);
+        }
+    }
+}
+
+/// A uniform point in the unit disk (rejection from the square).
+fn point_in_disk(rng: &mut Rng) -> (f64, f64) {
+    loop {
+        let (x, y) = (2.0 * rng.f64() - 1.0, 2.0 * rng.f64() - 1.0);
+        if x * x + y * y <= 1.0 {
+            return (x, y);
+        }
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+const DAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+const DAYS_JA: [&str; 7] = ["月曜", "火曜", "水曜", "木曜", "金曜", "土曜", "日曜"];
 
 impl Paradox {
     pub fn name(&self) -> &'static str {
@@ -175,54 +238,106 @@ impl Paradox {
             Paradox::Coupon { .. } => "coupon",
             Paradox::Secretary { .. } => "secretary",
             Paradox::Buffon { .. } => "buffon",
+            Paradox::BaseRate { .. } => "base-rate",
+            Paradox::Penney { .. } => "penney",
+            Paradox::BoyGirl { .. } => "boy-girl",
+            Paradox::Bertrand { .. } => "bertrand",
         }
     }
 
-    /// Whether some trials may not count (a random Monty Hall host).
+    /// Whether some trials may not count: the question is conditional (a
+    /// random Monty Hall host, a positive test, a family with a boy).
     pub fn may_reject(&self) -> bool {
         matches!(
             self,
             Paradox::MontyHall {
                 host_knows: false,
                 ..
-            }
+            } | Paradox::BaseRate { .. }
+                | Paradox::BoyGirl { .. }
         )
     }
 
     pub fn measure(&self) -> Measure {
         match self {
-            Paradox::Coupon { .. } => Measure::Mean,
+            Paradox::Coupon { budget: None, .. } => Measure::Mean,
             _ => Measure::Probability,
         }
     }
 
     /// The exact answer.
     pub fn theory(&self) -> f64 {
-        match *self {
+        match self {
             Paradox::MontyHall { doors, host_knows } => {
-                if host_knows {
-                    (doors - 1) as f64 / doors as f64
+                if *host_knows {
+                    (doors - 1) as f64 / *doors as f64
                 } else {
                     // Given that a random host revealed only goats: 1/2 for any n.
                     0.5
                 }
             }
-            Paradox::Birthday { people, days } => birthday_probability(people, days),
-            Paradox::Coupon { items } => items as f64 * harmonic(items as u64),
-            Paradox::Secretary { candidates, skip } => secretary_success(candidates, skip),
+            Paradox::Birthday {
+                people,
+                days,
+                weights,
+            } => match weights {
+                Some(w) => exact::birthday_probability_weighted(*people, &w.probs),
+                None => exact::birthday_probability(*people, *days),
+            },
+            Paradox::Coupon {
+                items,
+                weights,
+                budget,
+            } => match (weights, budget) {
+                (None, None) => exact::coupon_mean_equal(*items),
+                (Some(w), None) => exact::coupon_mean_weighted(&w.probs),
+                (None, Some(b)) => exact::coupon_complete_within_equal(*items, *b),
+                (Some(w), Some(b)) => exact::coupon_complete_within_weighted(&w.probs, *b),
+            },
+            Paradox::Secretary { candidates, skip } => exact::secretary_success(*candidates, *skip),
             Paradox::Buffon { length, spacing } => 2.0 * (length / spacing) / std::f64::consts::PI,
+            Paradox::BaseRate {
+                prevalence: p,
+                sensitivity: se,
+                specificity: sp,
+            } => {
+                let positive = p * se + (1.0 - p) * (1.0 - sp);
+                p * se / positive
+            }
+            Paradox::Penney { first, second } => exact::penney_second_wins(first, second),
+            Paradox::BoyGirl { tuesday } => {
+                if *tuesday {
+                    13.0 / 27.0
+                } else {
+                    1.0 / 3.0
+                }
+            }
+            Paradox::Bertrand { method } => match method {
+                Chord::Endpoints => 1.0 / 3.0,
+                Chord::Radius => 0.5,
+                Chord::Midpoint => 0.25,
+            },
         }
     }
 
-    /// The exact variance of one trial: p(1 - p) for a probability, and for
-    /// the coupon collector n^2 * sum 1/k^2 - n * H_n.
+    /// The exact variance of one trial: p(1 - p) for a probability; for the
+    /// equal-rate coupon collector n^2 * sum 1/k^2 - n * H_n; NaN when not
+    /// known in closed form (unequal rates).
     pub fn theory_variance(&self) -> f64 {
-        match *self {
-            Paradox::Coupon { items } => {
-                let n = items as f64;
-                let squares: f64 = (1..=items as u64).rev().map(|k| 1.0 / (k * k) as f64).sum();
-                n * n * squares - n * harmonic(items as u64)
+        match self {
+            Paradox::Coupon {
+                items,
+                weights: None,
+                budget: None,
+            } => {
+                let n = *items as f64;
+                let squares: f64 = (1..=*items as u64)
+                    .rev()
+                    .map(|k| 1.0 / (k * k) as f64)
+                    .sum();
+                n * n * squares - exact::coupon_mean_equal(*items)
             }
+            Paradox::Coupon { budget: None, .. } => f64::NAN,
             _ => {
                 let p = self.theory();
                 p * (1.0 - p)
@@ -232,32 +347,76 @@ impl Paradox {
 
     /// The exact answer as a fraction or formula, when that reads better.
     pub fn exact(&self) -> Option<String> {
-        match *self {
-            Paradox::MontyHall { doors, host_knows } => Some(if host_knows {
+        match self {
+            Paradox::MontyHall { doors, host_knows } => Some(if *host_knows {
                 format!("{}/{}", doors - 1, doors)
             } else {
                 "1/2".to_string()
             }),
-            Paradox::Coupon { items } => Some(format!("{items} x H_{items}")),
+            Paradox::Coupon {
+                items,
+                weights: None,
+                budget: None,
+            } => Some(format!("{items} x H_{items}")),
             Paradox::Buffon { .. } => Some("2l/(pi t)".to_string()),
+            Paradox::BaseRate { .. } => Some("p se / (p se + (1 - p)(1 - sp))".to_string()),
+            Paradox::Penney { first, second } => {
+                let l = exact::leading_number;
+                let for_b = l(first, first) - l(first, second);
+                let for_a = l(second, second) - l(second, first);
+                let g = gcd(for_b, for_b + for_a).max(1);
+                Some(format!("{}/{}", for_b / g, (for_b + for_a) / g))
+            }
+            Paradox::BoyGirl { tuesday } => {
+                Some(if *tuesday { "13/27" } else { "1/3" }.to_string())
+            }
+            Paradox::Bertrand { method } => Some(
+                match method {
+                    Chord::Endpoints => "1/3",
+                    Chord::Radius => "1/2",
+                    Chord::Midpoint => "1/4",
+                }
+                .to_string(),
+            ),
             _ => None,
         }
     }
 
     /// Parameters, for display and JSON.
     pub fn params(&self) -> Vec<(&'static str, String)> {
-        match *self {
+        match self {
             Paradox::MontyHall { doors, host_knows } => vec![
                 ("doors", doors.to_string()),
                 (
                     "host",
-                    if host_knows { "knows" } else { "random" }.to_string(),
+                    if *host_knows { "knows" } else { "random" }.to_string(),
                 ),
             ],
-            Paradox::Birthday { people, days } => {
-                vec![("people", people.to_string()), ("days", days.to_string())]
+            Paradox::Birthday {
+                people,
+                days,
+                weights,
+            } => {
+                let mut v = vec![("people", people.to_string()), ("days", days.to_string())];
+                if weights.is_some() {
+                    v.push(("dayWeights", "given".to_string()));
+                }
+                v
             }
-            Paradox::Coupon { items } => vec![("items", items.to_string())],
+            Paradox::Coupon {
+                items,
+                weights,
+                budget,
+            } => {
+                let mut v = vec![("items", items.to_string())];
+                if weights.is_some() {
+                    v.push(("weights", "given".to_string()));
+                }
+                if let Some(b) = budget {
+                    v.push(("budget", b.to_string()));
+                }
+                v
+            }
             Paradox::Secretary { candidates, skip } => vec![
                 ("candidates", candidates.to_string()),
                 ("skip", skip.to_string()),
@@ -268,11 +427,27 @@ impl Paradox {
                     ("spacing", format!("{spacing:e}")),
                 ]
             }
+            Paradox::BaseRate {
+                prevalence,
+                sensitivity,
+                specificity,
+            } => vec![
+                ("prevalence", prevalence.to_string()),
+                ("sensitivity", sensitivity.to_string()),
+                ("specificity", specificity.to_string()),
+            ],
+            Paradox::Penney { first, second } => {
+                vec![("first", coins_text(first)), ("second", coins_text(second))]
+            }
+            Paradox::BoyGirl { tuesday } => vec![(
+                "condition",
+                if *tuesday { "tuesday-boy" } else { "boy" }.to_string(),
+            )],
+            Paradox::Bertrand { method } => vec![("method", method.name().to_string())],
         }
     }
 
-    /// One trial, or None when the trial does not count (a random Monty Hall
-    /// host who revealed the car).
+    /// One trial, or None when the trial does not count (see `may_reject`).
     pub fn trial(&self, rng: &mut Rng, scratch: &mut Vec<u32>) -> Option<f64> {
         self.run(rng, scratch, None)
     }
@@ -291,9 +466,9 @@ impl Paradox {
     }
 
     fn run(&self, rng: &mut Rng, scratch: &mut Vec<u32>, mut story: Story) -> Option<f64> {
-        match *self {
+        match self {
             Paradox::MontyHall { doors, host_knows } => {
-                let n = doors as u64;
+                let n = *doors as u64;
                 let car = rng.below(n);
                 let pick = rng.below(n);
                 // The host opens every door except your pick and one other:
@@ -301,7 +476,7 @@ impl Paradox {
                 // A host who knows keeps the car closed when you missed it;
                 // otherwise he keeps a door chosen at random.
                 let other_than_pick = |k: u64| if k >= pick { k + 1 } else { k };
-                let kept = if host_knows && car != pick {
+                let kept = if *host_knows && car != pick {
                     car
                 } else {
                     other_than_pick(rng.below(n - 1))
@@ -342,11 +517,15 @@ impl Paradox {
                 }
                 Some(if wins { 1.0 } else { 0.0 })
             }
-            Paradox::Birthday { people, days } => {
+            Paradox::Birthday {
+                people,
+                days,
+                weights,
+            } => {
                 // scratch[d] holds the generation that last saw day d, and
                 // scratch[days] the current generation, so the days are not
                 // cleared on every trial.
-                let d_len = days as usize;
+                let d_len = *days as usize;
                 if scratch.len() != d_len + 1 {
                     scratch.clear();
                     scratch.resize(d_len + 1, 0);
@@ -357,8 +536,11 @@ impl Paradox {
                     generation = 1;
                 }
                 scratch[d_len] = generation;
-                for person in 1..=people {
-                    let d = rng.below(days as u64) as usize;
+                for person in 1..=*people {
+                    let d = match weights {
+                        Some(w) => w.sample(rng),
+                        None => rng.below(*days as u64) as usize,
+                    };
                     if scratch[d] == generation {
                         if let Some((s, lang)) = story.as_mut() {
                             let _ = match lang {
@@ -367,11 +549,7 @@ impl Paradox {
                                     "person {person} has day {} like someone before: a shared birthday",
                                     d + 1
                                 ),
-                                Lang::Ja => write!(
-                                    s,
-                                    "{person}人目の誕生日{}日目は先に来た人と同じ: 一致あり",
-                                    d + 1
-                                ),
+                                Lang::Ja => write!(s, "{person}人目の誕生日{}日目は先に来た人と同じ: 一致あり", d + 1),
                             };
                         }
                         return Some(1.0);
@@ -386,15 +564,22 @@ impl Paradox {
                 }
                 Some(0.0)
             }
-            Paradox::Coupon { items } => {
+            Paradox::Coupon {
+                items,
+                weights,
+                budget,
+            } => {
                 scratch.clear();
-                scratch.resize(items as usize, 0);
-                let (mut missing, mut draws) = (items, 0u64);
+                scratch.resize(*items as usize, 0);
+                let (mut missing, mut draws) = (*items, 0u64);
                 let mut seen: Vec<u64> = Vec::new();
                 let mut last = 0;
-                while missing > 0 {
+                while missing > 0 && budget.is_none_or(|b| draws < b) {
                     draws += 1;
-                    let i = rng.below(items as u64) as usize;
+                    let i = match weights {
+                        Some(w) => w.sample(rng),
+                        None => rng.below(*items as u64) as usize,
+                    };
                     if story.is_some() && seen.len() < 40 {
                         seen.push(i as u64 + 1);
                     }
@@ -415,25 +600,36 @@ impl Paradox {
                     } else {
                         ""
                     };
-                    let _ = match lang {
-                        Lang::En => write!(
+                    let _ = match (lang, missing) {
+                        (Lang::En, 0) => write!(
                             s,
                             "drew {list}{more}: complete after {draws} draws, the last new item was {last}"
                         ),
-                        Lang::Ja => write!(
+                        (Lang::En, m) => write!(s, "drew {list}{more}: {m} items still missing after {draws} draws"),
+                        (Lang::Ja, 0) => write!(
                             s,
                             "{list}{more} と引いて{draws}回でコンプリート。最後にそろったのは{last}番"
                         ),
+                        (Lang::Ja, m) => write!(s, "{list}{more} と引いて{draws}回、まだ{m}種足りない"),
                     };
                 }
-                Some(draws as f64)
+                Some(match budget {
+                    Some(_) => {
+                        if missing == 0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => draws as f64,
+                })
             }
             Paradox::Secretary { candidates, skip } => {
                 // Scores 0..n in random order; n-1 is the best.
                 scratch.clear();
-                scratch.extend(0..candidates);
+                scratch.extend(0..*candidates);
                 rng.shuffle(scratch);
-                let k = skip as usize;
+                let k = *skip as usize;
                 let bar = scratch[..k].iter().max().copied();
                 let hired = scratch[k..]
                     .iter()
@@ -468,10 +664,9 @@ impl Paradox {
                             sc + 1,
                             if best { "最も優秀な人" } else { "最も優秀な人ではない" }
                         ),
-                        (Lang::Ja, None) => write!(
-                            s,
-                            "{bar_text}。最も優秀な人が最初の{k}人にいたので、誰も上回れない"
-                        ),
+                        (Lang::Ja, None) => {
+                            write!(s, "{bar_text}。最も優秀な人が最初の{k}人にいたので、誰も上回れない")
+                        }
                     };
                 }
                 Some(if best { 1.0 } else { 0.0 })
@@ -510,241 +705,178 @@ impl Paradox {
                 }
                 Some(if crosses { 1.0 } else { 0.0 })
             }
+            Paradox::BaseRate {
+                prevalence,
+                sensitivity,
+                specificity,
+            } => {
+                let sick = rng.f64() < *prevalence;
+                let positive = if sick {
+                    rng.f64() < *sensitivity
+                } else {
+                    rng.f64() >= *specificity
+                };
+                if let Some((s, lang)) = story.as_mut() {
+                    let _ = match (lang, sick, positive) {
+                        (Lang::En, _, false) => write!(
+                            s,
+                            "{} and tests negative: not counted (the question is about positives)",
+                            if sick { "sick" } else { "healthy" }
+                        ),
+                        (Lang::En, true, true) => {
+                            write!(s, "sick and tests positive: a true positive")
+                        }
+                        (Lang::En, false, true) => {
+                            write!(s, "healthy but tests positive: a false alarm")
+                        }
+                        (Lang::Ja, _, false) => write!(
+                            s,
+                            "{}で陰性: 数えない(問われているのは陽性の人)",
+                            if sick { "病気" } else { "健康" }
+                        ),
+                        (Lang::Ja, true, true) => write!(s, "病気で陽性: 本当の陽性"),
+                        (Lang::Ja, false, true) => write!(s, "健康なのに陽性: 誤報"),
+                    };
+                }
+                if !positive {
+                    return None;
+                }
+                Some(if sick { 1.0 } else { 0.0 })
+            }
+            Paradox::Penney { first, second } => {
+                let n = first.len();
+                let bits = |c: &[bool]| c.iter().fold(0u32, |acc, &h| (acc << 1) | h as u32);
+                let (a, b, mask) = (bits(first), bits(second), (1u32 << n) - 1);
+                let (mut window, mut flips) = (0u32, 0u64);
+                let mut seen = String::new();
+                let second_wins = loop {
+                    let h = rng.next_u64() >> 63 == 1;
+                    window = ((window << 1) | h as u32) & mask;
+                    flips += 1;
+                    if story.is_some() && seen.len() < 60 {
+                        seen.push(if h { 'H' } else { 'T' });
+                    }
+                    if flips >= n as u64 {
+                        if window == b {
+                            break true;
+                        }
+                        if window == a {
+                            break false;
+                        }
+                    }
+                };
+                if let Some((s, lang)) = story.as_mut() {
+                    let more = if flips as usize > seen.len() {
+                        "..."
+                    } else {
+                        ""
+                    };
+                    let winner = coins_text(if second_wins { second } else { first });
+                    let _ = match lang {
+                        Lang::En => write!(
+                            s,
+                            "{seen}{more}: {winner} comes first after {flips} flips, the {} player wins",
+                            if second_wins { "second" } else { "first" }
+                        ),
+                        Lang::Ja => write!(
+                            s,
+                            "{seen}{more}: {flips}回目で{winner}が先に出て、{}の勝ち",
+                            if second_wins { "後手" } else { "先手" }
+                        ),
+                    };
+                }
+                Some(if second_wins { 1.0 } else { 0.0 })
+            }
+            Paradox::BoyGirl { tuesday } => {
+                let child = |rng: &mut Rng| (rng.next_u64() >> 63 == 1, rng.below(7) as usize);
+                let kids = [child(rng), child(rng)];
+                let counts = |&(boy, day): &(bool, usize)| boy && (!*tuesday || day == 1);
+                let qualifies = kids.iter().any(counts);
+                let both_boys = kids.iter().all(|k| k.0);
+                if let Some((s, lang)) = story.as_mut() {
+                    let describe = |&(boy, day): &(bool, usize), lang: Lang| match lang {
+                        Lang::En => format!(
+                            "a {} born on a {}",
+                            if boy { "boy" } else { "girl" },
+                            DAYS[day]
+                        ),
+                        Lang::Ja => format!(
+                            "{}生まれの{}",
+                            DAYS_JA[day],
+                            if boy { "男の子" } else { "女の子" }
+                        ),
+                    };
+                    let (k1, k2) = (describe(&kids[0], *lang), describe(&kids[1], *lang));
+                    let _ = match (*lang, qualifies) {
+                        (Lang::En, false) => write!(s, "{k1} and {k2}: not counted (no such boy)"),
+                        (Lang::En, true) => write!(
+                            s,
+                            "{k1} and {k2}: {}",
+                            if both_boys {
+                                "two boys"
+                            } else {
+                                "not two boys"
+                            }
+                        ),
+                        (Lang::Ja, false) => {
+                            write!(s, "{k1}と{k2}: 条件に合う男の子がいないので数えない")
+                        }
+                        (Lang::Ja, true) => write!(
+                            s,
+                            "{k1}と{k2}: {}",
+                            if both_boys {
+                                "2人とも男の子"
+                            } else {
+                                "2人とも男の子ではない"
+                            }
+                        ),
+                    };
+                }
+                if !qualifies {
+                    return None;
+                }
+                Some(if both_boys { 1.0 } else { 0.0 })
+            }
+            Paradox::Bertrand { method } => {
+                // Unit circle; the inscribed equilateral triangle's side is
+                // sqrt(3), so a chord is longer when its length squared > 3,
+                // or equally when its distance from the center is < 1/2.
+                let (longer, detail) = match method {
+                    Chord::Endpoints => {
+                        let (u, v) = (direction(rng), direction(rng));
+                        let len2 = (u.0 - v.0).powi(2) + (u.1 - v.1).powi(2);
+                        (len2 > 3.0, len2.sqrt())
+                    }
+                    Chord::Radius => {
+                        let d = rng.f64();
+                        (d * d < 0.25, 2.0 * (1.0 - d * d).sqrt())
+                    }
+                    Chord::Midpoint => {
+                        let (x, y) = point_in_disk(rng);
+                        let r2 = x * x + y * y;
+                        (r2 < 0.25, 2.0 * (1.0 - r2).sqrt())
+                    }
+                };
+                if let Some((s, lang)) = story.as_mut() {
+                    let _ = match lang {
+                        Lang::En => write!(
+                            s,
+                            "chord of length {detail:.3} (the triangle's side is 1.732): {}",
+                            if longer { "longer" } else { "not longer" }
+                        ),
+                        Lang::Ja => write!(
+                            s,
+                            "弦の長さ{detail:.3}(正三角形の辺は1.732): {}",
+                            if longer { "長い" } else { "長くない" }
+                        ),
+                    };
+                }
+                Some(if longer { 1.0 } else { 0.0 })
+            }
         }
     }
 
     pub fn texts(&self, lang: Lang) -> Texts {
-        let p = self.theory();
-        match (*self, lang) {
-            (Paradox::MontyHall { doors, host_knows: true }, Lang::En) => Texts {
-                title: format!("Monty Hall problem ({doors} doors, the host knows)"),
-                question: format!(
-                    "There are {doors} doors: a car behind one, goats behind the rest. You pick a door. \
-                     The host, who knows where the car is, opens {}, and offers you the one door left. \
-                     Should you switch?",
-                    others(doors - 2)
-                ),
-                intuition: "Two doors are left, so it is 50/50 and switching makes no difference.".into(),
-                truth: format!("Switching wins {}/{doors} of the time ({}).", doors - 1, pct(p)),
-                why: format!(
-                    "Your first pick is right only 1/{doors} of the time. The host never opens the car, \
-                     so in every other case the car is behind the door he leaves closed."
-                ),
-                unit: "games".into(),
-                one: "Game".into(),
-                quantity: "switching wins".into(),
-            },
-            (Paradox::MontyHall { doors, host_knows: true }, Lang::Ja) => Texts {
-                title: format!("モンティ・ホール問題(ドア{doors}枚、司会者は正解を知っている)"),
-                question: format!(
-                    "ドアが{doors}枚あり、1枚の後ろに車、残りはヤギです。あなたが1枚選ぶと、正解を知っている\
-                     司会者が残りから{}枚のヤギのドアを開け、閉じたまま残った1枚に変えてもよいと言います。変えるべき?",
-                    doors - 2
-                ),
-                intuition: "残りは2枚なので五分五分。変えても変えなくても同じ。".into(),
-                truth: format!("変えると{}/{doors}の確率({})で当たります。", doors - 1, pct(p)),
-                why: format!(
-                    "最初の選択が当たっているのは1/{doors}だけ。司会者は車のドアを開けないので、それ以外の\
-                     場合はすべて、司会者が閉じたまま残したドアに車があります。"
-                ),
-                unit: "回".into(),
-                one: "ゲーム目".into(),
-                quantity: "変えて当たる確率".into(),
-            },
-            (Paradox::MontyHall { doors, host_knows: false }, Lang::En) => Texts {
-                title: format!("Monty Hall, careless host ({doors} doors, the host does not know)"),
-                question: format!(
-                    "The same game, but the host does not know where the car is: he opens {} at random, \
-                     and this time {} a goat. Should you switch?",
-                    if doors == 3 { "another door".to_string() } else { format!("{} other doors", doors - 2) },
-                    if doors == 3 { "it happens to hide" } else { "every one happens to hide" }
-                ),
-                intuition: format!(
-                    "It looks just like the classic puzzle, so switching should win {}/{doors}.",
-                    doors - 1
-                ),
-                truth: "Switching wins only 1/2 of the games where the host happened to reveal no car.".into(),
-                why: "A random host reveals the car in many games. Keeping only the games where he did not \
-                      throws away most of the cases where switching would have won. Games where the car \
-                      was revealed are left out of the count."
-                    .into(),
-                unit: "games".into(),
-                one: "Game".into(),
-                quantity: "switching wins".into(),
-            },
-            (Paradox::MontyHall { doors, host_knows: false }, Lang::Ja) => Texts {
-                title: format!("うっかり司会者のモンティ・ホール(ドア{doors}枚、司会者は正解を知らない)"),
-                question: format!(
-                    "同じゲームですが、司会者は車の場所を知らず、残りから{}枚をでたらめに開けます。今回は\
-                     たまたま全部ヤギでした。変えるべき?",
-                    doors - 2
-                ),
-                intuition: format!("元の問題と同じに見えるので、変えれば{}/{doors}で当たるはず。", doors - 1),
-                truth: "司会者がたまたま車を開けなかったゲームに限ると、変えて当たるのは1/2です。".into(),
-                why: "でたらめに開ける司会者は、多くのゲームで車を開けてしまいます。車が出なかったゲームだけを\
-                      残すと、変えれば当たっていたはずのケースの多くが除かれます。車が開いたゲームは数えません。"
-                    .into(),
-                unit: "回".into(),
-                one: "ゲーム目".into(),
-                quantity: "変えて当たる確率".into(),
-            },
-            (Paradox::Birthday { people, days }, Lang::En) => Texts {
-                title: format!("Birthday paradox ({people} people, {days} days)"),
-                question: format!(
-                    "In a group of {people} people, how likely is it that at least two share a birthday? \
-                     (Each of {days} days equally likely.)"
-                ),
-                intuition: if people > days {
-                    "With more people than days, a shared birthday is certain (the pigeonhole principle).".into()
-                } else {
-                    format!(
-                        "{people} people for {days} days covers only {} of the days, so a shared birthday \
-                         should be rare.",
-                        pct(people as f64 / days as f64)
-                    )
-                },
-                truth: format!("At least two share a birthday with probability {}.", pct(p)),
-                why: format!("What matters is pairs, not people: {}.", pairs(people, Lang::En)),
-                unit: "groups".into(),
-                one: "Group".into(),
-                quantity: "a shared birthday".into(),
-            },
-            (Paradox::Birthday { people, days }, Lang::Ja) => Texts {
-                title: format!("誕生日のパラドックス({people}人、{days}日)"),
-                question: format!(
-                    "{people}人のグループで、誕生日が同じ人が少なくとも1組いる確率は?(誕生日は{days}日のどれも同じ確率)"
-                ),
-                intuition: if people > days {
-                    "日数より人数が多いので、必ず誰かの誕生日が重なる(鳩の巣原理)。".into()
-                } else {
-                    format!(
-                        "{days}日に対して{people}人は日数の{}にすぎないので、同じ誕生日はめったにないはず。",
-                        pct(people as f64 / days as f64)
-                    )
-                },
-                truth: format!("少なくとも1組が同じ誕生日になる確率は{}です。", pct(p)),
-                why: format!("効くのは人数ではなく組の数です。{}。", pairs(people, Lang::Ja)),
-                unit: "グループ".into(),
-                one: "グループ目".into(),
-                quantity: "同じ誕生日がいる確率".into(),
-            },
-            (Paradox::Coupon { items }, Lang::En) => Texts {
-                title: format!("Coupon collector, or completing a gacha ({items} items)"),
-                question: format!(
-                    "A gacha has {items} items, each equally likely on every draw. How many draws does it \
-                     take, on average, to collect them all?"
-                ),
-                intuition: format!("About {items} draws, maybe a few more."),
-                truth: format!("{:.1} draws on average ({items} x H_{items}).", p),
-                why: format!(
-                    "The last items are the hard part: with one item missing, each draw finds it with \
-                     probability 1/{items}, so that last item alone takes {items} draws on average."
-                ),
-                unit: "collectors".into(),
-                one: "Collector".into(),
-                quantity: "draws to complete".into(),
-            },
-            (Paradox::Coupon { items }, Lang::Ja) => Texts {
-                title: format!("コンプリートガチャ(クーポン収集問題、全{items}種)"),
-                question: format!(
-                    "全{items}種のガチャで、毎回どれも同じ確率で出ます。全種そろえるまでに平均何回引く?"
-                ),
-                intuition: format!("{items}回くらい、多くてもそれより少し多い程度。"),
-                truth: format!("平均{:.1}回です({items} x H_{items})。", p),
-                why: format!(
-                    "大変なのは最後の数種です。残り1種のときは1回あたり1/{items}でしか出ないので、最後の\
-                     1種だけで平均{items}回かかります。"
-                ),
-                unit: "人".into(),
-                one: "人目".into(),
-                quantity: "そろうまでの回数".into(),
-            },
-            (Paradox::Secretary { candidates, skip }, Lang::En) => Texts {
-                title: format!("Secretary problem ({candidates} candidates)"),
-                question: format!(
-                    "{candidates} candidates are interviewed in random order. After each one you must hire \
-                     or reject on the spot, and only the very best will do. What is your chance?"
-                ),
-                intuition: format!(
-                    "Without seeing everyone you are guessing, so about 1/{candidates} ({}).",
-                    pct(1.0 / candidates as f64)
-                ),
-                truth: format!(
-                    "Reject the first {skip} ({}), then hire the first who beats them all: the very best \
-                     is hired {} of the time.",
-                    pct(skip as f64 / candidates as f64),
-                    pct(p)
-                ),
-                why: "The first part sets the bar. As the number of candidates grows, the best share to \
-                      reject and the chance of success both approach 1/e, about 36.8%."
-                    .into(),
-                unit: "hirings".into(),
-                one: "Hiring".into(),
-                quantity: "the best is hired".into(),
-            },
-            (Paradox::Secretary { candidates, skip }, Lang::Ja) => Texts {
-                title: format!("秘書問題({candidates}人の候補者)"),
-                question: format!(
-                    "{candidates}人の候補者をランダムな順に面接し、1人ごとにその場で採用か不採用を決めます。\
-                     最も優秀な1人を採用できる確率は?"
-                ),
-                intuition: format!(
-                    "全員を見る前に決めるのだから当てずっぽうと同じで、1/{candidates}({})程度。",
-                    pct(1.0 / candidates as f64)
-                ),
-                truth: format!(
-                    "最初の{skip}人({})は見送り、それまでの全員より良い最初の人を採用すると、{}の確率で\
-                     最も優秀な人を採用できます。",
-                    pct(skip as f64 / candidates as f64),
-                    pct(p)
-                ),
-                why: "最初の何人かで基準を作るのがこつです。候補者が増えるほど、見送る割合と成功率はどちらも\
-                      1/e(約36.8%)に近づきます。"
-                    .into(),
-                unit: "回".into(),
-                one: "回目".into(),
-                quantity: "最も優秀な人を採用する確率".into(),
-            },
-            (Paradox::Buffon { length, spacing }, Lang::En) => Texts {
-                title: format!("Buffon's needle (length {}, lines {} apart)", num(length), num(spacing)),
-                question: format!(
-                    "Drop a needle of length {} on a floor ruled with lines {} apart. How often does it \
-                     cross a line?",
-                    num(length),
-                    num(spacing)
-                ),
-                intuition: "Hard to say, and surely nothing to do with circles.".into(),
-                truth: format!(
-                    "It crosses with probability 2l/(pi t) = {}, so counting crossings estimates pi.",
-                    pct(p)
-                ),
-                why: "Whether it crosses depends on the needle's angle, and averaging over every angle \
-                      brings in pi. The simulation itself never uses pi: each angle comes from a random \
-                      point in a quarter disk."
-                    .into(),
-                unit: "needles".into(),
-                one: "Needle".into(),
-                quantity: "a needle crosses a line".into(),
-            },
-            (Paradox::Buffon { length, spacing }, Lang::Ja) => Texts {
-                title: format!("ビュフォンの針(長さ{}、線の間隔{})", num(length), num(spacing)),
-                question: format!(
-                    "間隔{}で平行線を引いた床に、長さ{}の針を落とします。針が線と交わる確率は?",
-                    num(spacing),
-                    num(length)
-                ),
-                intuition: "見当がつかないし、円とは関係なさそう。".into(),
-                truth: format!(
-                    "交わる確率は2l/(πt) = {}。交わった回数を数えれば円周率を推定できます。",
-                    pct(p)
-                ),
-                why: "交わるかどうかは針の角度で決まり、あらゆる角度で平均するとπが現れます。このシミュレーション\
-                      自体はπを使いません。角度は四分円の中のランダムな点から作っています。"
-                    .into(),
-                unit: "本".into(),
-                one: "本目".into(),
-                quantity: "針が線と交わる確率".into(),
-            },
-        }
+        crate::texts::texts(self, lang)
     }
 }

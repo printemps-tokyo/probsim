@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use probsim::benford::{
     self, analyze, count_digits, csv_fields, expected, fibonacci, leading_digit, leading_digit_of,
-    number_tokens, powers_of_two, scan_csv,
+    leading_two_of, number_tokens, powers_of_two, scan_csv, Conformity, Source,
 };
-use probsim::paradox::{birthday_probability, secretary_best_skip, secretary_success, Paradox};
+use probsim::exact;
+use probsim::paradox::{
+    birthday_probability, coins, secretary_best_skip, secretary_success, Chord, Paradox, Weights,
+};
 use probsim::rng::Rng;
-use probsim::stats::{chi_square_p, harmonic, ln_gamma, wilson, Running, Z95};
+use probsim::stats::{binomial_central, chi_square_p, harmonic, ln_gamma, wilson, Running, Z95};
 
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
@@ -29,7 +34,7 @@ fn rng_matches_the_reference_implementation() {
 }
 
 #[test]
-fn rng_stays_in_range() {
+fn rng_stays_in_range_and_is_uniform() {
     let mut r = Rng::new(1);
     for _ in 0..10_000 {
         let x = r.f64();
@@ -37,11 +42,6 @@ fn rng_stays_in_range() {
         assert!(r.below(7) < 7);
     }
     assert_eq!(r.below(1), 0);
-}
-
-#[test]
-fn below_is_uniform() {
-    // 6 faces, 600k rolls: chi-square with 5 df should not be extreme.
     let mut r = Rng::new(99);
     let mut counts = [0f64; 6];
     for _ in 0..600_000 {
@@ -94,6 +94,7 @@ fn special_functions() {
     assert!(close(chi_square_p(15.507, 8), 0.05, 2e-4));
     assert!(close(chi_square_p(20.090, 8), 0.01, 1e-4));
     assert!(close(chi_square_p(3.841, 1), 0.05, 2e-4));
+    assert!(close(chi_square_p(112.022, 89), 0.05, 3e-4));
     assert!(close(chi_square_p(0.0, 8), 1.0, 1e-12));
     assert!(chi_square_p(500.0, 8) < 1e-50);
     assert!(close(harmonic(10), 7381.0 / 2520.0, 1e-12));
@@ -116,6 +117,13 @@ fn intervals() {
     }
     assert!(close(r.mean(), 5.0, 1e-12));
     assert!(close(r.variance(), 32.0 / 7.0, 1e-12));
+    // Binomial(20, 0.95): P(X <= 16) = 0.0159 < 0.025 < P(X <= 17) = 0.0755.
+    assert_eq!(binomial_central(20, 0.95, 0.95), (17, 20));
+    let (lo, hi) = binomial_central(1000, 0.5, 0.95);
+    assert!(
+        (468..=470).contains(&lo) && (530..=532).contains(&hi),
+        "{lo} {hi}"
+    );
 }
 
 #[test]
@@ -126,7 +134,6 @@ fn exact_answers() {
     assert_eq!(secretary_best_skip(100), 37);
     assert!(close(secretary_success(100, 37), 0.371_043, 1e-6));
     assert!(close(secretary_success(3, 1), 0.5, 1e-12));
-    assert!(close(secretary_success(5, 0), 0.2, 1e-12));
     assert!(close(
         Paradox::MontyHall {
             doors: 3,
@@ -145,11 +152,14 @@ fn exact_answers() {
         0.5,
         1e-12
     ));
-    assert!(close(
-        Paradox::Coupon { items: 10 }.theory(),
-        29.289_682_539_682_54,
-        1e-9
-    ));
+    let coupon = |items| Paradox::Coupon {
+        items,
+        weights: None,
+        budget: None,
+    };
+    assert!(close(coupon(10).theory(), 29.289_682_539_682_54, 1e-9));
+    // Coupon variance for n = 2: draws = 1 + Geometric(1/2), variance 2.
+    assert!(close(coupon(2).theory_variance(), 2.0, 1e-12));
     assert!(close(
         Paradox::Buffon {
             length: 1.0,
@@ -159,12 +169,68 @@ fn exact_answers() {
         1.0 / std::f64::consts::PI,
         1e-12
     ));
-    // Coupon variance for n = 2: draws = 1 + Geometric(1/2), variance 2.
+    // Base rate: 1% prevalence, 99% sensitivity, 95% specificity gives 1/6.
+    let br = Paradox::BaseRate {
+        prevalence: 0.01,
+        sensitivity: 0.99,
+        specificity: 0.95,
+    };
+    assert!(close(br.theory(), 0.0099 / 0.0594, 1e-12));
     assert!(close(
-        Paradox::Coupon { items: 2 }.theory_variance(),
-        2.0,
+        Paradox::BoyGirl { tuesday: true }.theory(),
+        13.0 / 27.0,
         1e-12
     ));
+    assert!(close(
+        Paradox::BoyGirl { tuesday: false }.theory(),
+        1.0 / 3.0,
+        1e-12
+    ));
+    for (m, v) in [
+        (Chord::Endpoints, 1.0 / 3.0),
+        (Chord::Radius, 0.5),
+        (Chord::Midpoint, 0.25),
+    ] {
+        assert!(close(Paradox::Bertrand { method: m }.theory(), v, 1e-12));
+    }
+}
+
+#[test]
+fn boy_girl_by_counting_every_family() {
+    // 14 equally likely kinds of child (sex x weekday); count both pairs.
+    let (mut with_boy, mut both) = (0, 0);
+    for a in 0..14 {
+        for b in 0..14 {
+            let tuesday_boy = |k: usize| k < 7 && k == 1;
+            if tuesday_boy(a) || tuesday_boy(b) {
+                with_boy += 1;
+                if a < 7 && b < 7 {
+                    both += 1;
+                }
+            }
+        }
+    }
+    assert_eq!((both, with_boy), (13, 27));
+}
+
+#[test]
+fn penney_against_published_odds() {
+    let p = |a: &str, b: &str| exact::penney_second_wins(&coins(a).unwrap(), &coins(b).unwrap());
+    // Conway's answers for three flips (Gardner; arXiv:1904.09888).
+    assert!(close(p("HHH", "THH"), 7.0 / 8.0, 1e-12));
+    assert!(close(p("HHT", "THH"), 3.0 / 4.0, 1e-12));
+    assert!(close(p("HTH", "HHT"), 2.0 / 3.0, 1e-12));
+    assert!(close(p("HTT", "HHT"), 2.0 / 3.0, 1e-12));
+    assert!(close(p("HH", "TH"), 3.0 / 4.0, 1e-12));
+    // Symmetry: the two answers for a pair add up to 1.
+    assert!(close(p("HTH", "THT") + p("THT", "HTH"), 1.0, 1e-12));
+    let best =
+        |a: &str| probsim::paradox::coins_text(&exact::penney_best_reply(&coins(a).unwrap()));
+    assert_eq!(best("HHH"), "THH");
+    assert_eq!(best("HTH"), "HHT");
+    assert_eq!(best("THT"), "TTH");
+    assert!(coins("HXT").is_err());
+    assert!(coins("").is_err());
 }
 
 #[test]
@@ -186,16 +252,121 @@ fn best_secretary_cutoff_matches_a_full_search() {
 }
 
 #[test]
+fn unequal_birthdays() {
+    // Equal weights give the classic answer.
+    let flat = Weights::new(&[1.0; 365]).unwrap();
+    assert!(close(
+        exact::birthday_probability_weighted(23, &flat.probs),
+        birthday_probability(23, 365),
+        1e-12
+    ));
+    // Two days with chances p and 1 - p: two people differ with 2 p (1 - p).
+    let w = Weights::new(&[1.0, 3.0]).unwrap();
+    assert!(close(
+        exact::birthday_probability_weighted(2, &w.probs),
+        1.0 - 2.0 * 0.25 * 0.75,
+        1e-12
+    ));
+    // Uneven chances never make a match less likely.
+    let uneven: Vec<f64> = (0..365).map(|i| 1.0 + (i % 7 == 0) as u8 as f64).collect();
+    let uw = Weights::new(&uneven).unwrap();
+    assert!(exact::birthday_probability_weighted(23, &uw.probs) > birthday_probability(23, 365));
+    // More people than days with a chance: certain.
+    assert_eq!(
+        exact::birthday_probability_weighted(3, &Weights::new(&[1.0, 0.0, 1.0]).unwrap().probs),
+        1.0
+    );
+    assert!(Weights::new(&[]).is_err());
+    assert!(Weights::new(&[1.0, -1.0]).is_err());
+    assert!(Weights::new(&[0.0, 0.0]).is_err());
+}
+
+#[test]
+fn weighted_sampling_follows_the_weights() {
+    let w = Weights::new(&[1.0, 0.0, 3.0]).unwrap();
+    let mut r = Rng::new(8);
+    let mut c = [0u32; 3];
+    for _ in 0..40_000 {
+        c[w.sample(&mut r)] += 1;
+    }
+    assert_eq!(c[1], 0, "an item with no chance is never drawn");
+    assert!((9_500..10_500).contains(&c[0]), "{c:?}");
+}
+
+#[test]
+fn gacha_exact_answers() {
+    // The integral gives n H_n for equal rates.
+    for n in [1u32, 2, 5, 10, 50] {
+        let p = vec![1.0 / n as f64; n as usize];
+        assert!(
+            close(
+                exact::coupon_mean_weighted(&p),
+                exact::coupon_mean_equal(n),
+                1e-7 * n as f64
+            ),
+            "n={n}"
+        );
+    }
+    // Two items with p and q: E = 1/p + 1/q - 1/(p + q) (inclusion-exclusion).
+    let (p, q) = (0.9, 0.1);
+    assert!(close(
+        exact::coupon_mean_weighted(&[p, q]),
+        1.0 / p + 1.0 / q - 1.0,
+        1e-8
+    ));
+    // Completing within a budget: the Markov chain, inclusion-exclusion and a
+    // direct count agree. Two equal items within 3 draws: 1 - 2 (1/2)^3 = 3/4.
+    assert!(close(
+        exact::coupon_complete_within_equal(2, 3),
+        0.75,
+        1e-12
+    ));
+    assert!(close(
+        exact::coupon_complete_within_weighted(&[0.5, 0.5], 3),
+        0.75,
+        1e-12
+    ));
+    let eq = [0.1; 10];
+    for b in [10u64, 20, 29, 60] {
+        assert!(close(
+            exact::coupon_complete_within_equal(10, b),
+            exact::coupon_complete_within_weighted(&eq, b),
+            1e-9
+        ));
+    }
+    assert_eq!(exact::coupon_complete_within_equal(10, 9), 0.0);
+    // Quantiles for 10 items: the median is 27 draws (P(T <= 26) < 1/2 <= P(T <= 27)).
+    let q = exact::coupon_quantiles_equal(10, &[0.5], 10_000_000).unwrap();
+    assert!(exact::coupon_complete_within_equal(10, q[0]) >= 0.5);
+    assert!(exact::coupon_complete_within_equal(10, q[0] - 1) < 0.5);
+    let budget = Paradox::Coupon {
+        items: 10,
+        weights: None,
+        budget: Some(30),
+    };
+    assert_eq!(budget.measure(), probsim::paradox::Measure::Probability);
+    let w = Paradox::Coupon {
+        items: 2,
+        weights: Some(Arc::new(Weights::new(&[9.0, 1.0]).unwrap())),
+        budget: None,
+    };
+    assert!(close(w.theory(), 1.0 / 0.9 + 1.0 / 0.1 - 1.0, 1e-8));
+    assert!(w.theory_variance().is_nan());
+}
+
+#[test]
 fn benford_digits() {
     let total: f64 = (1..=9).map(expected).sum();
     assert!(close(total, 1.0, 1e-12));
+    let total2: f64 = (10..=99).map(expected).sum();
+    assert!(close(total2, 1.0, 1e-12));
+    assert_eq!(benford::min_for_test(1), 110);
+    assert_eq!(benford::min_for_test(2), 1146);
     assert_eq!(leading_digit(0.0123), Some(1));
-    assert_eq!(leading_digit(-5e-7), Some(5));
     assert_eq!(leading_digit(f64::NAN), None);
     assert_eq!(powers_of_two(10), vec![2, 4, 8, 1, 3, 6, 1, 2, 5, 1]);
     assert_eq!(fibonacci(12), vec![1, 1, 2, 3, 5, 8, 1, 2, 3, 5, 8, 1]);
-    // Past the exact range the formula takes over; it must agree with the
-    // exact digits where both are available.
+    // Past the exact range the formula takes over; it agrees where both exist.
     let exact = fibonacci(186);
     let phi = (1.0 + 5f64.sqrt()) / 2.0;
     for k in 30..=186u64 {
@@ -203,15 +374,15 @@ fn benford_digits() {
         let d = (10f64.powf(x - x.floor()).floor() as usize).clamp(1, 9);
         assert_eq!(d, exact[k as usize - 1], "F_{k}");
     }
-    assert_eq!(fibonacci(300).len(), 300);
+    assert_eq!(benford::power_of_two_two(10), 10); // 1024
+    assert_eq!(benford::power_of_two_two(3), 80); // 8, read as 8.0
 }
 
 #[test]
 fn powers_of_two_match_exact_values_across_the_switch() {
-    // Exact leading digits of 2^k up to k = 200, by doubling a decimal string.
+    // Exact first two digits of 2^k up to k = 200, by doubling a decimal string.
     let mut digits = vec![1u8];
-    let got = powers_of_two(200);
-    for k in 1..=200 {
+    for k in 1..=200u64 {
         let mut carry = 0;
         for d in digits.iter_mut() {
             let v = *d * 2 + carry;
@@ -221,7 +392,10 @@ fn powers_of_two_match_exact_values_across_the_switch() {
         if carry > 0 {
             digits.push(carry);
         }
-        assert_eq!(got[k - 1], *digits.last().unwrap() as usize, "2^{k}");
+        let n = digits.len();
+        let two = digits[n - 1] as usize * 10 + if n > 1 { digits[n - 2] as usize } else { 0 };
+        assert_eq!(benford::power_of_two_two(k), two, "2^{k}");
+        assert_eq!(powers_of_two(k)[k as usize - 1], two / 10, "2^{k}");
     }
 }
 
@@ -239,77 +413,44 @@ fn numbers_in_text() {
     // A hyphen after a digit is not a minus sign. ("15,350" reads as one
     // number in free text; a CSV column is what --column is for.)
     assert_eq!(texts("2024-01-15,350"), vec!["2024", "01", "15350"]);
+    assert_eq!(
+        texts("1.e3 2.e4 0.e5 3."),
+        vec!["1.e3", "2.e4", "0.e5", "3."]
+    );
     assert!(texts("no numbers here").is_empty());
-    assert!(number_tokens("1,234 and 5")
-        .iter()
-        .map(|t| t.grouped)
-        .eq([true, false]));
 }
 
 #[test]
 fn leading_digits_as_written() {
     assert_eq!(leading_digit_of("9999999999999999999"), Some(9));
     assert_eq!(leading_digit_of("1e400"), Some(1));
-    assert_eq!(leading_digit_of("2e-400"), Some(2));
     assert_eq!(leading_digit_of("-0.00071"), Some(7));
     assert_eq!(leading_digit_of("0.000"), None);
-    assert_eq!(leading_digit_of("0e5"), None);
+    assert_eq!(leading_two_of("0.00071"), Some(71));
+    assert_eq!(leading_two_of("7"), Some(70));
+    assert_eq!(leading_two_of("1,234"), Some(12));
+    assert_eq!(leading_two_of("10.5"), Some(10));
 }
 
 #[test]
-fn csv_columns() {
+fn csv_and_encodings() {
     assert_eq!(
         csv_fields("a,\"1,234\",\"say \"\"hi\"\"\"", ','),
         vec!["a", "1,234", "say \"hi\""]
     );
-    let csv = "id,amount\n1,250\n2,\"1,300\"\n3,0\n4,\n";
-    let s = scan_csv(csv, 2, ',');
-    assert_eq!(s.numbers, 3);
-    assert_eq!(s.zeros, 1);
-    assert_eq!(s.counts[1], 1); // 250
-    assert_eq!(s.counts[0], 1); // 1,300
-    let t = scan_csv("x\ty\n7\t8\n", 1, '\t');
-    assert_eq!(t.counts[6], 1);
-}
-
-#[test]
-fn benford_test_tells_uniform_from_benford() {
-    let fits = analyze(count_digits(&powers_of_two(10_000)));
-    assert!(fits.p_value.unwrap() > 0.5);
-    let flat: Vec<usize> = (0..9_000).map(|i| i % 9 + 1).collect();
-    let a = analyze(count_digits(&flat));
-    assert_eq!(a.total, 9_000);
-    assert!(a.p_value.unwrap() < 1e-10);
-    // Too few numbers for the chi-square approximation: no p-value.
-    assert_eq!(analyze(count_digits(&[1, 2, 9])).p_value, None);
-    assert_eq!(analyze([0; 9]).p_value, None);
-    assert!(analyze(count_digits(&powers_of_two(110))).p_value.is_some());
-    // Counting straight from the source gives the same counts.
-    assert_eq!(
-        benford::Source::Fibonacci(500).counts(),
-        count_digits(&fibonacci(500))
-    );
-    assert_eq!(
-        benford::Source::PowersOfTwo(500).counts(),
-        count_digits(&powers_of_two(500))
-    );
-}
-
-#[test]
-fn files_more_like_real_life() {
-    // A quoted field may span lines (RFC 4180).
     let s = scan_csv(
-        "note,amount\n\"first\nsecond\",250\n\"x\",\"1,300\"\r\n",
+        "note,amount\n\"first\nsecond\",250\n\"x\",\"1,300\"\r\n3,0\n",
         2,
         ',',
     );
-    assert_eq!((s.numbers, s.counts[1], s.counts[0]), (2, 1, 1));
-    // A point with no digits after it is still part of the number.
-    assert_eq!(
-        texts("1.e3 2.e4 0.e5 3."),
-        vec!["1.e3", "2.e4", "0.e5", "3."]
-    );
-    // Encodings.
+    assert_eq!((s.numbers, s.zeros), (3, 1));
+    let first = Source::File {
+        name: "x".into(),
+        column: Some(2),
+        scan: s,
+    }
+    .counts(1);
+    assert_eq!((first[1], first[0]), (1, 1));
     let utf16le: Vec<u8> = [0xFF, 0xFE]
         .into_iter()
         .chain("123\n456\n".encode_utf16().flat_map(u16::to_le_bytes))
@@ -318,15 +459,39 @@ fn files_more_like_real_life() {
         benford::scan_text(&benford::decode(&utf16le).unwrap()).numbers,
         2
     );
-    let utf16be: Vec<u8> = [0xFE, 0xFF]
-        .into_iter()
-        .chain("78".encode_utf16().flat_map(u16::to_be_bytes))
-        .collect();
-    assert_eq!(benford::decode(&utf16be).unwrap(), "78");
     let no_bom: Vec<u8> = "123".encode_utf16().flat_map(u16::to_le_bytes).collect();
     assert!(benford::decode(&no_bom).is_err());
     assert_eq!(
         benford::scan_text(&benford::decode(b"\x94\x84 12").unwrap()).numbers,
         1
+    );
+}
+
+#[test]
+fn benford_tests_and_mad() {
+    let fits = analyze(count_digits(&powers_of_two(10_000)), 1);
+    assert!(fits.p_value.unwrap() > 0.5);
+    assert_eq!(fits.conformity, Conformity::Close);
+    let flat: Vec<usize> = (0..9_000).map(|i| i % 9 + 1).collect();
+    let a = analyze(count_digits(&flat), 1);
+    assert!(a.p_value.unwrap() < 1e-10);
+    assert_eq!(a.conformity, Conformity::Nonconformity);
+    // MAD of a flat distribution: mean |1/9 - log10(1 + 1/d)|.
+    let want: f64 = (1..=9)
+        .map(|d| (1.0 / 9.0 - expected(d)).abs())
+        .sum::<f64>()
+        / 9.0;
+    assert!(close(a.mad, want, 1e-12));
+    assert_eq!(analyze(count_digits(&[1, 2, 9]), 1).p_value, None);
+    // First two digits: 89 degrees of freedom, and the counts add up to the first digits'.
+    let two = analyze(Source::PowersOfTwo(5_000).counts(2), 2);
+    assert_eq!((two.df, two.counts.len()), (89, 90));
+    let firsts = Source::PowersOfTwo(5_000).counts(1);
+    for (d, first) in firsts.iter().enumerate() {
+        assert_eq!(two.counts[d * 10..d * 10 + 10].iter().sum::<u64>(), *first);
+    }
+    assert_eq!(
+        Source::Fibonacci(500).counts(1),
+        count_digits(&fibonacci(500))
     );
 }

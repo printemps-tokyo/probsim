@@ -23,6 +23,9 @@ pub struct Outcome {
     pub successes: u64,
     /// The running mean and variance of the counted trials.
     pub running: Running,
+    /// For an average of whole numbers (the coupon collector's draws): how
+    /// many trials gave each value, for quantiles.
+    pub distribution: Option<std::collections::BTreeMap<u64, u64>>,
     pub estimate: f64,
     pub standard_error: f64,
     /// 95% confidence interval, or None when there are too few trials for
@@ -97,6 +100,8 @@ pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
     let mut rng = Rng::new(seed);
     let mut running = Running::default();
     let mut successes = 0u64;
+    let mut distribution =
+        (p.measure() == Measure::Mean).then(std::collections::BTreeMap::<u64, u64>::new);
     let probability = p.measure() == Measure::Probability;
     let estimate = |running: &Running, successes: u64| {
         if probability && running.n > 0 {
@@ -113,6 +118,9 @@ pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
             running.push(x);
             if probability && x == 1.0 {
                 successes += 1;
+            }
+            if let Some(d) = distribution.as_mut() {
+                *d.entry(x as u64).or_insert(0) += 1;
             }
             if next_mark < marks.len() && running.n >= marks[next_mark] {
                 next_mark += 1;
@@ -131,12 +139,13 @@ pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
         _ => f64::NAN,
     };
     let mut o = Outcome {
-        paradox: *p,
+        paradox: p.clone(),
         seed,
         attempted: trials,
         counted: n,
         successes,
         running,
+        distribution,
         estimate: est,
         standard_error,
         ci95: None,
@@ -145,4 +154,22 @@ pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
     };
     o.ci95 = o.interval(Z95);
     o
+}
+
+/// The smallest value v with at least a share `q` of trials at or below it,
+/// from a distribution of whole numbers.
+pub fn quantile(d: &std::collections::BTreeMap<u64, u64>, q: f64) -> Option<u64> {
+    let total: u64 = d.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let need = (q * total as f64).ceil().max(1.0) as u64;
+    let mut acc = 0;
+    for (&v, &c) in d {
+        acc += c;
+        if acc >= need {
+            return Some(v);
+        }
+    }
+    d.keys().next_back().copied()
 }

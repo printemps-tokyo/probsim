@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::benford::{self, Analysis, Scan, Source, MIN_FOR_TEST};
+use crate::benford::{self, Analysis, Conformity, Scan, Source};
 use crate::paradox::{Lang, Measure, Paradox};
 use crate::sim::{Checkpoint, Outcome};
 use crate::stats::{MIN_FOR_MEAN, Z95};
@@ -413,17 +413,37 @@ pub fn report(o: &Outcome, opt: &TextOptions) -> String {
     let _ = writeln!(s, "{pad}{}", wrap(verdict, WRAP - pad.len(), pad.len()));
     if o.counted < o.attempted {
         let skipped = o.attempted - o.counted;
-        let note = match opt.lang {
-            Lang::En => format!(
-                "{} games where the host revealed the car were not counted",
-                grouped(skipped)
-            ),
-            Lang::Ja => format!(
+        let note = match (opt.lang, &o.paradox) {
+            (Lang::En, Paradox::MontyHall { .. }) => {
+                format!(
+                    "{} games where the host revealed the car were not counted",
+                    grouped(skipped)
+                )
+            }
+            (Lang::Ja, Paradox::MontyHall { .. }) => format!(
                 "司会者が車を開けてしまった{}回は数えていません",
                 grouped(skipped)
             ),
+            (Lang::En, Paradox::BaseRate { .. }) => format!(
+                "{} people who tested negative were not counted",
+                grouped(skipped)
+            ),
+            (Lang::Ja, Paradox::BaseRate { .. }) => {
+                format!("陰性だった{}人は数えていません", grouped(skipped))
+            }
+            (Lang::En, _) => format!(
+                "{} families without such a boy were not counted",
+                grouped(skipped)
+            ),
+            (Lang::Ja, _) => format!(
+                "条件に合う男の子がいない{}家族は数えていません",
+                grouped(skipped)
+            ),
         };
-        let _ = writeln!(s, "{pad}{note}");
+        let _ = writeln!(s, "{pad}{}", wrap(&note, WRAP - pad.len(), pad.len()));
+    }
+    if let Some(q) = quantile_note(o, opt.lang) {
+        let _ = writeln!(s, "{pad}{q}");
     }
     if let Paradox::Buffon { length, spacing } = o.paradox {
         let f = |x: Option<f64>| x.map_or("-".to_string(), |v| format!("{v:.5}"));
@@ -491,9 +511,22 @@ fn scan_notes(scan: &Scan, column: Option<usize>, lang: Lang) -> Vec<String> {
     notes
 }
 
+fn conformity_text(c: Conformity, lang: Lang) -> &'static str {
+    match (c, lang) {
+        (Conformity::Close, Lang::En) => "close conformity",
+        (Conformity::Acceptable, Lang::En) => "acceptable conformity",
+        (Conformity::Marginal, Lang::En) => "marginally acceptable conformity",
+        (Conformity::Nonconformity, Lang::En) => "nonconformity",
+        (Conformity::Close, Lang::Ja) => "よく適合",
+        (Conformity::Acceptable, Lang::Ja) => "許容範囲の適合",
+        (Conformity::Marginal, Lang::Ja) => "ぎりぎり許容範囲",
+        (Conformity::Nonconformity, Lang::Ja) => "不適合",
+    }
+}
+
 /// The Benford report.
 pub fn benford_report(source: &Source, a: &Analysis, opt: &TextOptions) -> String {
-    let [title, question, intuition, truth, why] = benford::texts(source, opt.lang);
+    let [title, question, intuition, truth, why] = benford::texts(source, a.digits, opt.lang);
     let l = labels(opt.lang);
     let mut s = String::new();
     let _ = writeln!(s, "{title}\n");
@@ -501,9 +534,10 @@ pub fn benford_report(source: &Source, a: &Analysis, opt: &TextOptions) -> Strin
     let _ = writeln!(s, "{}", field(l.intuition, &intuition));
     let _ = writeln!(s, "{}", field(l.truth, &truth));
     let _ = writeln!(s, "{}\n", field(l.why, &why));
-    let (h_digit, h_exp, h_obs) = match opt.lang {
-        Lang::En => ("digit", "Benford", "observed"),
-        Lang::Ja => ("数字", "法則", "実測"),
+    let (h_digit, h_exp, h_obs) = match (opt.lang, a.digits) {
+        (Lang::En, 2) => ("digits", "Benford", "observed"),
+        (Lang::En, _) => ("digit", "Benford", "observed"),
+        (Lang::Ja, _) => ("数字", "法則", "実測"),
     };
     let _ = writeln!(
         s,
@@ -512,21 +546,25 @@ pub fn benford_report(source: &Source, a: &Analysis, opt: &TextOptions) -> Strin
         pad_left(h_exp, 9),
         pad_left(h_obs, 10)
     );
-    let share = |d: usize| {
+    let values: Vec<usize> = benford::range(a.digits).collect();
+    let share = |i: usize| {
         if a.total == 0 {
             0.0
         } else {
-            a.counts[d - 1] as f64 / a.total as f64
+            a.counts[i] as f64 / a.total as f64
         }
     };
     // Bars fit the chart width, on one scale for the observed and the expected share.
-    let longest = (1..=9)
-        .map(|d| share(d).max(benford::expected(d)))
+    let longest = values
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| share(i).max(benford::expected(d)))
         .fold(0.0, f64::max);
     let room = opt.width.saturating_sub(10).max(10) as f64;
     let scale = room / longest;
-    for d in 1..=9 {
-        let (e, o) = (benford::expected(d), share(d));
+    let decimals = if a.digits == 2 { 2 } else { 1 };
+    for (i, &d) in values.iter().enumerate() {
+        let (e, o) = (benford::expected(d), share(i));
         let (bar_o, mark) = (
             (o * scale).round() as usize,
             (e * scale).round().max(1.0) as usize,
@@ -538,7 +576,7 @@ pub fn benford_report(source: &Source, a: &Analysis, opt: &TextOptions) -> Strin
         bar[mark - 1] = if bar_o >= mark { '|' } else { ':' };
         let _ = writeln!(
             s,
-            "  {:<6}{:>8.1}%{:>9.1}%  {}",
+            "  {:<6}{:>8.decimals$}%{:>9.decimals$}%  {}",
             d,
             e * 100.0,
             o * 100.0,
@@ -550,32 +588,53 @@ pub fn benford_report(source: &Source, a: &Analysis, opt: &TextOptions) -> Strin
         Lang::Ja => "(#が実測、|または:が法則どおりの位置)",
     };
     let _ = writeln!(s, "  {legend}\n");
+    let min = benford::min_for_test(a.digits);
     let line = match (a.p_value, opt.lang) {
         (Some(p), Lang::En) => format!(
-            "{} numbers, chi-square {:.3} (8 df), p = {:.4}: {}",
+            "{} numbers, chi-square {:.3} ({} df), p = {:.4}: {}",
             grouped(a.total),
             a.chi_square,
+            a.df,
             p,
             if p >= 0.05 { "consistent with Benford's law (p >= 0.05)" } else { "differs from Benford's law (p < 0.05)" }
         ),
         (Some(p), Lang::Ja) => format!(
-            "{}個、カイ二乗 {:.3}(自由度8)、p = {:.4}: {}",
+            "{}個、カイ二乗 {:.3}(自由度{})、p = {:.4}: {}",
             grouped(a.total),
             a.chi_square,
+            a.df,
             p,
             if p >= 0.05 { "ベンフォードの法則と矛盾しません(p >= 0.05)" } else { "ベンフォードの法則とずれています(p < 0.05)" }
         ),
         (None, Lang::En) => format!(
-            "{} numbers: too few for the chi-square test (it needs at least {MIN_FOR_TEST}, so that every \
-             digit is expected at least 5 times).",
-            grouped(a.total)
+            "{} numbers: too few for the chi-square test (it needs at least {}, so that every value is \
+             expected at least 5 times).",
+            grouped(a.total),
+            grouped(min)
         ),
         (None, Lang::Ja) => format!(
-            "{}個: カイ二乗検定には少なすぎます(どの数字も5回以上期待できる{MIN_FOR_TEST}個以上が必要)。",
-            grouped(a.total)
+            "{}個: カイ二乗検定には少なすぎます(どの値も5回以上期待できる{}個以上が必要)。",
+            grouped(a.total),
+            grouped(min)
         ),
     };
     let _ = writeln!(s, "  {}", wrap(&line, WRAP - 2, 2));
+    let [c1, c2, c3] = benford::mad_thresholds(a.digits);
+    let mad = match opt.lang {
+        Lang::En => format!(
+            "MAD {:.5}: {} by Nigrini's rule of thumb (close up to {c1}, acceptable up to {c2}, marginal up to \
+             {c3}). Unlike the p-value, it does not shrink to \"differs\" just because the data is large.",
+            a.mad,
+            conformity_text(a.conformity, Lang::En)
+        ),
+        Lang::Ja => format!(
+            "MAD {:.5}: Nigriniの目安で「{}」(よく適合は{c1}まで、許容範囲は{c2}まで、ぎりぎりは{c3}まで)。\
+             p値と違い、データが多いだけで「ずれている」とはなりません。",
+            a.mad,
+            conformity_text(a.conformity, Lang::Ja)
+        ),
+    };
+    let _ = writeln!(s, "  {}", wrap(&mad, WRAP - 2, 2));
     if let Source::File { scan, column, .. } = source {
         for note in scan_notes(scan, *column, opt.lang) {
             let _ = writeln!(s, "  {}", wrap(&note, WRAP - 2, 2));
@@ -649,6 +708,338 @@ pub fn summary(outcomes: &[Outcome], benford: Option<(&Source, &Analysis)>, lang
             format!("{} {}", src.name(), grouped(a.total)),
             verdict
         );
+    }
+    s
+}
+
+/// Quantiles of the draws to complete a gacha: simulated, and exact for
+/// equal rates when the Markov chain is small enough.
+fn coupon_quantiles(o: &Outcome, lang: Lang) -> Option<String> {
+    let Paradox::Coupon {
+        items,
+        weights,
+        budget: None,
+    } = &o.paradox
+    else {
+        return None;
+    };
+    let d = o.distribution.as_ref()?;
+    let qs = [0.5, 0.9, 0.99];
+    let sim: Vec<u64> = qs
+        .iter()
+        .map(|&q| crate::sim::quantile(d, q))
+        .collect::<Option<_>>()?;
+    let exact = if weights.is_none() {
+        crate::exact::coupon_quantiles_equal(*items, &qs, 200_000_000)
+    } else {
+        None
+    };
+    let show = |i: usize| match &exact {
+        Some(e) => match lang {
+            Lang::En => format!("{} draws (exact {})", sim[i], e[i]),
+            Lang::Ja => format!("{}回(正解{}回)", sim[i], e[i]),
+        },
+        None => match lang {
+            Lang::En => format!("{} draws", sim[i]),
+            Lang::Ja => format!("{}回", sim[i]),
+        },
+    };
+    Some(match lang {
+        Lang::En => format!(
+            "Half of the collectors were done within {}, 90% within {}, 99% within {}: the average \
+             hides a long tail of unlucky collectors.",
+            show(0),
+            show(1),
+            show(2)
+        ),
+        Lang::Ja => format!(
+            "半数の人は{}以内、90%の人は{}以内、99%の人は{}以内にそろいました。平均の陰には、運の悪い人の長いすそ野があります。",
+            show(0),
+            show(1),
+            show(2)
+        ),
+    })
+}
+
+/// The quantile line for a coupon report, wrapped, if there is one.
+pub fn quantile_note(o: &Outcome, lang: Lang) -> Option<String> {
+    coupon_quantiles(o, lang).map(|q| wrap(&q, WRAP - 13, 13))
+}
+
+/// A sweep: one row per parameter value, then a chart of exact and simulated.
+pub fn sweep_report(points: &[crate::study::SweepPoint], name: &str, opt: &TextOptions) -> String {
+    let mut s = String::new();
+    let Some(first) = points.first() else {
+        return s;
+    };
+    let t = first.outcome.paradox.texts(opt.lang);
+    let m = first.outcome.paradox.measure();
+    let trials = first.outcome.attempted;
+    let _ = match opt.lang {
+        Lang::En => writeln!(
+            s,
+            "{}: {} as {name} changes ({} trials per point)\n",
+            first.outcome.paradox.name(),
+            t.quantity,
+            grouped(trials)
+        ),
+        Lang::Ja => writeln!(
+            s,
+            "{}: {name}を変えたときの{}(各{}回)\n",
+            first.outcome.paradox.name(),
+            t.quantity,
+            grouped(trials)
+        ),
+    };
+    let (h_exact, h_sim, h_ci) = match opt.lang {
+        Lang::En => ("exact", "simulated", "95% CI"),
+        Lang::Ja => ("正解", "結果", "95%信頼区間"),
+    };
+    let _ = writeln!(
+        s,
+        "  {}  {}  {}  {}",
+        pad_left(name, 10),
+        pad_left(h_exact, 10),
+        pad_left(h_sim, 10),
+        h_ci
+    );
+    for p in points {
+        let o = &p.outcome;
+        let ci = o.ci95.map_or("-".to_string(), |(lo, hi)| {
+            format!("[{}, {}]", value(m, lo), value(m, hi))
+        });
+        let _ = writeln!(
+            s,
+            "  {:>10}  {:>10}  {:>10}  {}",
+            crate::paradox::num(p.value),
+            value(m, o.theory),
+            value(m, o.estimate),
+            ci
+        );
+    }
+    if opt.chart && points.len() > 1 {
+        let _ = writeln!(s);
+        for line in sweep_chart(points, m, opt.width, 12) {
+            let _ = writeln!(s, "  {line}");
+        }
+        let _ = writeln!(
+            s,
+            "  {}",
+            match opt.lang {
+                Lang::En => "o exact   * simulated   @ both",
+                Lang::Ja => "o 正解   * 結果   @ 両方",
+            }
+        );
+    }
+    s
+}
+
+fn sweep_chart(
+    points: &[crate::study::SweepPoint],
+    m: Measure,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let width = width.max(10);
+    let ys: Vec<f64> = points
+        .iter()
+        .flat_map(|p| [p.outcome.theory, p.outcome.estimate])
+        .collect();
+    let (mut lo, mut hi) = (
+        ys.iter().copied().fold(f64::INFINITY, f64::min),
+        ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    if m == Measure::Probability {
+        lo = lo.max(0.0);
+        hi = hi.min(1.0);
+    }
+    if hi - lo < 1e-9 {
+        hi += 1e-3;
+        lo -= 1e-3;
+    }
+    let (x0, x1) = (points[0].value, points[points.len() - 1].value);
+    let col = |x: f64| {
+        if x1 > x0 {
+            (((x - x0) / (x1 - x0)) * (width - 1) as f64).round() as usize
+        } else {
+            0
+        }
+    };
+    let row = |y: f64| {
+        (((hi - y) / (hi - lo)) * (height - 1) as f64)
+            .round()
+            .clamp(0.0, (height - 1) as f64) as usize
+    };
+    let mut grid = vec![vec![' '; width]; height];
+    for p in points {
+        let c = col(p.value).min(width - 1);
+        let (re, rs) = (row(p.outcome.theory), row(p.outcome.estimate));
+        grid[re][c] = 'o';
+        grid[rs][c] = if rs == re { '@' } else { '*' };
+    }
+    let lw = value(m, hi).len().max(value(m, lo).len());
+    let mut out: Vec<String> = (0..height)
+        .map(|r| {
+            let label = if r == 0 {
+                value(m, hi)
+            } else if r == height - 1 {
+                value(m, lo)
+            } else {
+                String::new()
+            };
+            format!(
+                "{label:>lw$} |{}",
+                grid[r].iter().collect::<String>().trim_end()
+            )
+        })
+        .collect();
+    out.push(format!("{:>lw$} +{}", "", "-".repeat(width)));
+    let (a, b) = (crate::paradox::num(x0), crate::paradox::num(x1));
+    out.push(format!(
+        "{:>lw$}  {a}{}{b}",
+        "",
+        " ".repeat(width.saturating_sub(a.len() + b.len()))
+    ));
+    out
+}
+
+/// A coverage study: a ladder of the first intervals, and how many runs'
+/// 95% intervals contained the exact answer.
+pub fn coverage_report(
+    p: &Paradox,
+    runs: &[crate::study::Run],
+    asked: u64,
+    trials: u64,
+    opt: &TextOptions,
+) -> String {
+    let mut s = String::new();
+    let m = p.measure();
+    let theory = p.theory();
+    let hits = runs.iter().filter(|r| r.hit).count();
+    let _ = match opt.lang {
+        Lang::En => writeln!(
+            s,
+            "What a 95% confidence interval means: {} runs of {} with {} trials each.\n",
+            grouped(asked),
+            p.name(),
+            grouped(trials)
+        ),
+        Lang::Ja => writeln!(
+            s,
+            "95%信頼区間の意味: {}を各{}回で{}回実行。\n",
+            p.name(),
+            grouped(trials),
+            grouped(asked)
+        ),
+    };
+    let width = opt.width.max(20);
+    let shown: Vec<&crate::study::Run> = runs.iter().take(40).collect();
+    if opt.chart && !shown.is_empty() {
+        let span = shown
+            .iter()
+            .map(|r| {
+                (r.interval.0 - theory)
+                    .abs()
+                    .max((r.interval.1 - theory).abs())
+            })
+            .fold(0.0, f64::max)
+            .max(1e-12)
+            * 1.05;
+        let col = |v: f64| {
+            ((((v - theory) / span + 1.0) / 2.0) * (width - 1) as f64)
+                .round()
+                .clamp(0.0, (width - 1) as f64) as usize
+        };
+        let mid = col(theory);
+        for r in &shown {
+            let mut line = vec![' '; width];
+            let (a, b) = (col(r.interval.0), col(r.interval.1));
+            for c in line.iter_mut().take(b + 1).skip(a) {
+                *c = '-';
+            }
+            line[a] = '[';
+            line[b] = ']';
+            line[col(r.estimate).clamp(a, b)] = '*';
+            // The exact answer as a vertical line through the ladder.
+            if matches!(line[mid], ' ' | '-') {
+                line[mid] = '|';
+            }
+            let _ = writeln!(
+                s,
+                "  {} {}",
+                line.iter().collect::<String>(),
+                if r.hit { "" } else { "<- misses" }
+            );
+        }
+        let _ = writeln!(
+            s,
+            "  {}{}\n",
+            " ".repeat(mid.saturating_sub(3)),
+            match opt.lang {
+                Lang::En => format!("exact {}", value(m, theory)),
+                Lang::Ja => format!("正解 {}", value(m, theory)),
+            }
+        );
+    }
+    let judged = runs.len();
+    let share = if judged == 0 {
+        0.0
+    } else {
+        hits as f64 / judged as f64
+    };
+    // How many hits a 95% method gives in this many runs, 95% of the time.
+    let (k_lo, k_hi) = crate::stats::binomial_central(judged as u64, 0.95, 0.95);
+    let expected_lo = (
+        k_lo as f64 / judged.max(1) as f64,
+        k_hi as f64 / judged.max(1) as f64,
+    );
+    let _ = match opt.lang {
+        Lang::En => writeln!(
+            s,
+            "{}",
+            wrap(
+                &format!(
+                    "{hits} of {judged} intervals ({}) contained the exact answer. A 95% interval is a method \
+                     that catches the answer in about 95% of runs; any one interval either contains it or \
+                     does not. (With this many runs, a correct 95% method catches it in {} to {} of them, 95% of the time.)",
+                    crate::paradox::pct(share),
+                    crate::paradox::pct(expected_lo.0),
+                    crate::paradox::pct(expected_lo.1)
+                ),
+                WRAP,
+                0
+            )
+        ),
+        Lang::Ja => writeln!(
+            s,
+            "{}",
+            wrap(
+                &format!(
+                    "{judged}個の区間のうち{hits}個({})が正解を含みました。95%信頼区間とは、約95%の実行で正解を\
+                     とらえる方法のことで、1つ1つの区間は正解を含むか含まないかのどちらかです(この回数なら、\
+                     正しい95%の方法でも、この回数なら当たる割合はおよそ{}から{}の間でばらつきます)。",
+                    crate::paradox::pct(share),
+                    crate::paradox::pct(expected_lo.0),
+                    crate::paradox::pct(expected_lo.1)
+                ),
+                WRAP,
+                0
+            )
+        ),
+    };
+    if (judged as u64) < asked {
+        let _ = match opt.lang {
+            Lang::En => writeln!(
+                s,
+                "{} runs had too few trials for an interval and were left out.",
+                asked - judged as u64
+            ),
+            Lang::Ja => writeln!(
+                s,
+                "{}回は試行が少なく区間が出せないため除きました。",
+                asked - judged as u64
+            ),
+        };
     }
     s
 }
@@ -770,28 +1161,82 @@ pub fn benford_json(source: &Source, a: &Analysis) -> String {
         ),
         _ => String::new(),
     };
-    let digits = (1..=9)
-        .map(|d| {
+    let values: Vec<usize> = benford::range(a.digits).collect();
+    let rows = values
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| {
             format!(
-                "{{\"digit\":{d},\"count\":{},\"share\":{},\"benford\":{}}}",
-                a.counts[d - 1],
+                "{{\"digits\":{d},\"count\":{},\"share\":{},\"benford\":{}}}",
+                a.counts[i],
                 json_num(if a.total == 0 {
                     0.0
                 } else {
-                    a.counts[d - 1] as f64 / a.total as f64
+                    a.counts[i] as f64 / a.total as f64
                 }),
                 json_num(benford::expected(d))
             )
         })
         .collect::<Vec<_>>()
         .join(",");
+    let conformity = match a.conformity {
+        Conformity::Close => "close",
+        Conformity::Acceptable => "acceptable",
+        Conformity::Marginal => "marginal",
+        Conformity::Nonconformity => "nonconformity",
+    };
     format!(
-        "{{\"paradox\":\"benford\",\"source\":{}{file},\"total\":{},\"chiSquare\":{},\"df\":8,\"pValue\":{},\"digits\":[{}]}}",
+        "{{\"paradox\":\"benford\",\"source\":{}{file},\"firstDigits\":{},\"total\":{},\"chiSquare\":{},\"df\":{},\"pValue\":{},\"mad\":{},\"conformity\":\"{conformity}\",\"values\":[{}]}}",
         json_str(source.name()),
+        a.digits,
         a.total,
         json_num(a.chi_square),
+        a.df,
         json_opt(a.p_value),
-        digits
+        json_num(a.mad),
+        rows
+    )
+}
+
+pub fn sweep_json(points: &[crate::study::SweepPoint], name: &str, seed: u64) -> String {
+    let rows = points
+        .iter()
+        .map(|p| {
+            format!(
+                "{{\"value\":{},\"result\":{}}}",
+                json_num(p.value),
+                outcome_json(&p.outcome, &[])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"sweep\":{},\"seed\":{seed},\"points\":[{rows}]}}",
+        json_str(name)
+    )
+}
+
+pub fn coverage_json(p: &Paradox, runs: &[crate::study::Run], asked: u64, trials: u64) -> String {
+    let hits = runs.iter().filter(|r| r.hit).count();
+    let list = runs
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"seed\":{},\"estimate\":{},\"ci95\":[{},{}],\"hit\":{}}}",
+                r.seed,
+                json_num(r.estimate),
+                json_num(r.interval.0),
+                json_num(r.interval.1),
+                r.hit
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"coverage\":{},\"theory\":{},\"runs\":{asked},\"judged\":{},\"hits\":{hits},\"trials\":{trials},\"intervals\":[{list}]}}",
+        json_str(p.name()),
+        json_num(p.theory()),
+        runs.len()
     )
 }
 

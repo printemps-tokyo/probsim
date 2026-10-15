@@ -1,42 +1,60 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use probsim::benford::{self, Source};
+use probsim::exact::MAX_WEIGHTED_BUDGET_ITEMS;
+use probsim::export;
 use probsim::output::{
-    benford_json, benford_report, explain_block, outcome_json, report, summary, TextOptions,
+    benford_json, benford_report, coverage_json, coverage_report, explain_block, outcome_json,
+    report, summary, sweep_json, sweep_report, TextOptions,
 };
-use probsim::paradox::{secretary_best_skip, Lang, Paradox};
+use probsim::paradox::{coins, secretary_best_skip, Chord, Lang, Paradox, Weights};
 use probsim::rng::Rng;
 use probsim::sim::{derived_seed, simulate, Outcome};
+use probsim::study;
 
 const HELP: &str = "\
 probsim: watch probability paradoxes converge, next to their exact answers.
 
 Usage: probsim <paradox> [options]
        probsim all [options]
+       probsim sweep <paradox> --vary NAME --from A --to B [--steps N] [options]
+       probsim coverage <paradox> [--runs N] [options]
+       probsim play monty-hall [--doors N]
        probsim list
 
 Paradoxes:
-  monty-hall   Switch doors or not?             --doors N (3), --random-host
-  birthday     A shared birthday in a group     --people N (23), --days N (365)
-  coupon       Draws to complete a gacha        --items N (10)        (alias: gacha)
-  secretary    Hire the best, deciding on the spot
-                                                --candidates N (100), --skip K (best)
-  buffon       Buffon's needle, and pi          --length L (1), --spacing T (2), L <= T
-  benford      Leading digits                   --source powers2|fibonacci (powers2),
-                                                --file PATH (your own numbers),
-                                                --column N, --delimiter C (CSV)
+  monty-hall   Switch doors or not?           --doors N (3), --random-host
+  birthday     A shared birthday in a group   --people N (23), --days N (365),
+                                              --day-weights PATH (one weight per day)
+  coupon       Draws to complete a gacha      --items N (10), --weights LIST or
+               (alias: gacha)                 --weights-file PATH, --budget N
+  secretary    Hire the best on the spot      --candidates N (100), --skip K (best)
+  buffon       Buffon's needle, and pi        --length L (1), --spacing T (2), L <= T
+  base-rate    A positive test: sick?         --prevalence P (0.01), --sensitivity P
+                                              (0.99), --specificity P (0.95)
+  penney       Penney's coin game             --first HHT, --second SEQ (best reply)
+  boy-girl     Two children, one a boy...     --any-day (drop the Tuesday)
+  bertrand     A random chord                 --method endpoints|radius|midpoint
+  benford      Leading digits                 --source powers2|fibonacci,
+                                              --file PATH (- for stdin), --column N,
+                                              --delimiter C, --digits 1|2
 
 Options:
-  --trials N     Trials to run, 1 to 100,000,000 (100,000); for benford, terms
+  --trials N     Trials, 1 to 100,000,000 (100,000; sweep 10,000; coverage
+                 1,000); for benford, terms
   --explain N    Tell the first N trials step by step, 1 to 100 (same seed, same trials)
   --seed N       Seed for a repeatable run, 0 to 9007199254740991 (random when
                  omitted; always printed)
   --check        Exit 1 if an exact answer is outside the 99.9% interval
                  (benford: p < 0.001); exit 2 if there are too few trials to judge
   --json         JSON instead of text
-  --no-chart     Leave out the convergence chart
+  --csv          CSV instead of text (a run's checkpoints, a sweep's points,
+                 a coverage study's runs)
+  --svg PATH     Also write the convergence chart as an SVG file
+  --no-chart     Leave out the chart
   --width N      Chart width in columns, 10 to 200 (60)
   --lang L       auto, ja or en (auto reads LC_ALL, LC_MESSAGES, LANG)
   -h, --help     This help
@@ -50,29 +68,63 @@ const Z999: f64 = 3.290_526_731_491_926;
 /// The largest seed that survives a trip through JSON numbers (2^53 - 1).
 const MAX_SEED: u64 = (1 << 53) - 1;
 
+/// The paradoxes that simulate (not benford), in `list` and `all` order.
+const SIMS: &[&str] = &[
+    "monty-hall",
+    "birthday",
+    "coupon",
+    "secretary",
+    "buffon",
+    "base-rate",
+    "penney",
+    "boy-girl",
+    "bertrand",
+];
+
+#[derive(Clone)]
 struct Args {
     command: String,
-    trials: u64,
+    target: Option<String>,
+    trials: Option<u64>,
     explain: u32,
     seed: Option<u64>,
     check: bool,
     json: bool,
+    csv: bool,
+    svg: Option<String>,
     chart: bool,
     width: usize,
     lang: Option<Lang>,
     doors: u32,
     random_host: bool,
     people: u32,
-    days: u32,
-    items: u32,
+    days: Option<u32>,
+    day_weights: Option<String>,
+    items: Option<u32>,
+    weights: Option<String>,
+    weights_file: Option<String>,
+    budget: Option<u64>,
     candidates: u32,
     skip: Option<u32>,
     length: f64,
     spacing: f64,
+    prevalence: f64,
+    sensitivity: f64,
+    specificity: f64,
+    first: String,
+    second: Option<String>,
+    any_day: bool,
+    method: Chord,
     source: Option<String>,
     file: Option<String>,
     column: Option<usize>,
     delimiter: Option<char>,
+    digits: usize,
+    vary: Option<String>,
+    from: Option<f64>,
+    to: Option<f64>,
+    steps: usize,
+    runs: u64,
     /// Options given, to reject ones that do not apply to the command.
     given: Vec<String>,
 }
@@ -97,12 +149,29 @@ fn in_range<T: PartialOrd + std::fmt::Display>(
     }
 }
 
+/// A probability: 0.05 or 5%.
+fn fraction(flag: &str, v: Option<String>) -> Result<f64, String> {
+    let v = v.ok_or_else(|| format!("{flag} needs a value"))?;
+    let x = match v.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f64>().map(|x| x / 100.0),
+        None => v.parse::<f64>(),
+    }
+    .map_err(|_| format!("{flag}: {v:?} is not a probability (like 0.05 or 5%)"))?;
+    if (0.0..=1.0).contains(&x) {
+        Ok(x)
+    } else {
+        Err(format!("{flag} must be from 0 to 1 (or 0% to 100%)"))
+    }
+}
+
 /// Options that take no value.
 const SWITCHES: &[&str] = &[
     "--check",
     "--json",
+    "--csv",
     "--no-chart",
     "--random-host",
+    "--any-day",
     "--help",
     "--version",
 ];
@@ -111,27 +180,47 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
     let mut it = argv.into_iter();
     let mut a = Args {
         command: String::new(),
-        trials: 100_000,
+        target: None,
+        trials: None,
         explain: 0,
         seed: None,
         check: false,
         json: false,
+        csv: false,
+        svg: None,
         chart: true,
         width: 60,
         lang: None,
         doors: 3,
         random_host: false,
         people: 23,
-        days: 365,
-        items: 10,
+        days: None,
+        day_weights: None,
+        items: None,
+        weights: None,
+        weights_file: None,
+        budget: None,
         candidates: 100,
         skip: None,
         length: 1.0,
         spacing: 2.0,
+        prevalence: 0.01,
+        sensitivity: 0.99,
+        specificity: 0.95,
+        first: "HHT".into(),
+        second: None,
+        any_day: false,
+        method: Chord::Endpoints,
         source: None,
         file: None,
         column: None,
         delimiter: None,
+        digits: 1,
+        vary: None,
+        from: None,
+        to: None,
+        steps: 0,
+        runs: 100,
         given: Vec::new(),
     };
     while let Some(arg) = it.next() {
@@ -152,11 +241,13 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
                 println!("probsim {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
-            "--trials" => a.trials = in_range(&flag, number(&flag, val())?, 1, 100_000_000)?,
+            "--trials" => a.trials = Some(in_range(&flag, number(&flag, val())?, 1, 100_000_000)?),
             "--explain" => a.explain = in_range(&flag, number(&flag, val())?, 1, 100)?,
             "--seed" => a.seed = Some(in_range(&flag, number(&flag, val())?, 0, MAX_SEED)?),
             "--check" => a.check = true,
             "--json" => a.json = true,
+            "--csv" => a.csv = true,
+            "--svg" => a.svg = Some(val().ok_or("--svg needs a file name")?),
             "--no-chart" => a.chart = false,
             "--width" => a.width = in_range(&flag, number(&flag, val())?, 10, 200)?,
             "--lang" => {
@@ -170,14 +261,38 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
             "--doors" => a.doors = in_range(&flag, number(&flag, val())?, 3, 1_000)?,
             "--random-host" => a.random_host = true,
             "--people" => a.people = in_range(&flag, number(&flag, val())?, 1, 100_000)?,
-            "--days" => a.days = in_range(&flag, number(&flag, val())?, 1, 100_000)?,
-            "--items" => a.items = in_range(&flag, number(&flag, val())?, 1, 10_000)?,
+            "--days" => a.days = Some(in_range(&flag, number(&flag, val())?, 1, 100_000)?),
+            "--day-weights" => {
+                a.day_weights = Some(val().ok_or("--day-weights needs a file name")?)
+            }
+            "--items" => a.items = Some(in_range(&flag, number(&flag, val())?, 1, 10_000)?),
+            "--weights" => a.weights = Some(val().ok_or("--weights needs a list, like 1,1,1,0.2")?),
+            "--weights-file" => {
+                a.weights_file = Some(val().ok_or("--weights-file needs a file name")?)
+            }
+            "--budget" => a.budget = Some(in_range(&flag, number(&flag, val())?, 1, 100_000_000)?),
             "--candidates" => a.candidates = in_range(&flag, number(&flag, val())?, 1, 100_000)?,
             "--skip" => a.skip = Some(number(&flag, val())?),
             "--length" => a.length = number(&flag, val())?,
             "--spacing" => a.spacing = number(&flag, val())?,
+            "--prevalence" => a.prevalence = fraction(&flag, val())?,
+            "--sensitivity" => a.sensitivity = fraction(&flag, val())?,
+            "--specificity" => a.specificity = fraction(&flag, val())?,
+            "--first" => a.first = val().ok_or("--first needs a sequence, like HHT")?,
+            "--second" => a.second = Some(val().ok_or("--second needs a sequence, like THH")?),
+            "--any-day" => a.any_day = true,
+            "--method" => {
+                a.method = match val().as_deref() {
+                    Some("endpoints") => Chord::Endpoints,
+                    Some("radius") => Chord::Radius,
+                    Some("midpoint") => Chord::Midpoint,
+                    _ => return Err("--method must be endpoints, radius or midpoint".into()),
+                }
+            }
             "--source" => a.source = Some(val().ok_or("--source needs a value")?),
-            "--file" => a.file = Some(val().ok_or("--file needs a value")?),
+            "--file" => {
+                a.file = Some(val().ok_or("--file needs a file name, or - for standard input")?)
+            }
             "--column" => a.column = Some(in_range(&flag, number(&flag, val())?, 1, 10_000)?),
             "--delimiter" => {
                 a.delimiter = Some(match val().as_deref() {
@@ -186,9 +301,23 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
                     _ => return Err("--delimiter must be one character, or tab".into()),
                 })
             }
-            f if f.starts_with('-') => return Err(format!("unknown option {f:?}; see --help")),
+            "--digits" => a.digits = in_range(&flag, number(&flag, val())?, 1, 2)?,
+            "--vary" => a.vary = Some(val().ok_or("--vary needs a parameter name")?),
+            "--from" => a.from = Some(number(&flag, val())?),
+            "--to" => a.to = Some(number(&flag, val())?),
+            "--steps" => a.steps = in_range(&flag, number(&flag, val())?, 2, 200)?,
+            "--runs" => a.runs = in_range(&flag, number(&flag, val())?, 1, 100_000)?,
+            f if f.starts_with('-') && f != "-" => {
+                return Err(format!("unknown option {f:?}; see --help"))
+            }
             _ if a.command.is_empty() => {
                 a.command = arg;
+                continue;
+            }
+            _ if a.target.is_none()
+                && matches!(a.command.as_str(), "sweep" | "coverage" | "play") =>
+            {
+                a.target = Some(arg);
                 continue;
             }
             _ => return Err(format!("unexpected argument {arg:?}; see --help")),
@@ -203,45 +332,155 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
     Ok(Some(a))
 }
 
-/// Whether an option means anything for a command.
+/// The paradox a command runs: the command itself, or the one after
+/// sweep, coverage or play.
+fn subject(a: &Args) -> &str {
+    a.target.as_deref().unwrap_or(&a.command)
+}
+
+/// Whether an option means anything here.
 fn applies(a: &Args, flag: &str) -> bool {
-    let c = a.command.as_str();
-    let sims = [
-        "monty-hall",
-        "birthday",
-        "coupon",
-        "gacha",
-        "secretary",
-        "buffon",
-    ];
+    let (c, p) = (a.command.as_str(), subject(a));
+    let study = matches!(c, "sweep" | "coverage");
     match flag {
         _ if c == "list" => false,
-        "--doors" | "--random-host" => c == "monty-hall",
-        "--people" | "--days" => c == "birthday",
-        "--items" => c == "coupon" || c == "gacha",
-        "--candidates" | "--skip" => c == "secretary",
-        "--length" | "--spacing" => c == "buffon",
-        "--source" | "--file" => c == "benford",
+        _ if c == "play" => matches!(flag, "--doors" | "--seed" | "--lang"),
+        "--doors" | "--random-host" => p == "monty-hall",
+        "--people" | "--days" | "--day-weights" => p == "birthday",
+        "--items" | "--weights" | "--weights-file" | "--budget" => p == "coupon" || p == "gacha",
+        "--candidates" | "--skip" => p == "secretary",
+        "--length" | "--spacing" => p == "buffon",
+        "--prevalence" | "--sensitivity" | "--specificity" => p == "base-rate",
+        "--first" | "--second" => p == "penney",
+        "--any-day" => p == "boy-girl",
+        "--method" => p == "bertrand",
+        "--source" | "--file" | "--digits" => c == "benford",
         "--column" | "--delimiter" => c == "benford" && a.file.is_some(),
         // A file has as many numbers as it has; --trials sets a sequence's length.
         "--trials" => c != "benford" || a.file.is_none(),
-        "--explain" => sims.contains(&c),
-        "--no-chart" | "--width" => c != "all",
+        "--explain" | "--svg" => SIMS.contains(&c) || c == "gacha",
+        "--vary" | "--from" | "--to" | "--steps" => c == "sweep",
+        "--runs" => c == "coverage",
+        "--check" => c != "sweep" && c != "coverage",
+        "--csv" => c != "all" && c != "benford",
+        "--no-chart" | "--width" => c != "all" || study,
         _ => true,
     }
 }
 
-fn paradox(a: &Args, command: &str) -> Result<Paradox, String> {
-    Ok(match command {
+/// Numbers in a list or a file ("1, 1, 0.5" or one per line).
+fn numbers_from(text: &str) -> Result<Vec<f64>, String> {
+    benford::number_tokens(text)
+        .iter()
+        .map(|t| {
+            t.text
+                .parse::<f64>()
+                .map_err(|_| format!("{:?} is not a number", t.text))
+        })
+        .collect()
+}
+
+fn read_file(path: &str) -> Result<String, String> {
+    let bytes = if path == "-" {
+        let mut b = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut b)
+            .map_err(|e| format!("cannot read standard input: {e}"))?;
+        b
+    } else {
+        std::fs::read(path).map_err(|e| format!("cannot read {path:?}: {e}"))?
+    };
+    // Not necessarily UTF-8 (a Shift_JIS CSV, say): see benford::decode.
+    benford::decode(&bytes).map_err(|e| format!("{path:?}: {e}"))
+}
+
+fn paradox(a: &Args, name: &str) -> Result<Paradox, String> {
+    Ok(match name {
         "monty-hall" => Paradox::MontyHall {
             doors: a.doors,
             host_knows: !a.random_host,
         },
-        "birthday" => Paradox::Birthday {
-            people: a.people,
-            days: a.days,
-        },
-        "coupon" | "gacha" => Paradox::Coupon { items: a.items },
+        "birthday" => {
+            let weights = match &a.day_weights {
+                Some(path) => Some(Arc::new(
+                    Weights::new(&numbers_from(&read_file(path)?)?)
+                        .map_err(|e| format!("--day-weights: {e}"))?,
+                )),
+                None => None,
+            };
+            let days = match (&weights, a.days) {
+                (Some(w), Some(d)) if d as usize != w.len() => {
+                    return Err(format!(
+                        "--days {d} does not match the {} day weights",
+                        w.len()
+                    ))
+                }
+                (Some(w), _) => w.len() as u32,
+                (None, d) => d.unwrap_or(365),
+            };
+            Paradox::Birthday {
+                people: a.people,
+                days,
+                weights,
+            }
+        }
+        "coupon" | "gacha" => {
+            let list = match (&a.weights, &a.weights_file) {
+                (Some(_), Some(_)) => {
+                    return Err("give --weights or --weights-file, not both".into())
+                }
+                (Some(l), None) => Some(numbers_from(l)?),
+                (None, Some(f)) => Some(numbers_from(&read_file(f)?)?),
+                (None, None) => None,
+            };
+            let weights = match list {
+                Some(l) => {
+                    let w = Weights::new(&l).map_err(|e| format!("--weights: {e}"))?;
+                    if w.probs.contains(&0.0) {
+                        return Err(
+                            "--weights: an item with weight 0 can never be collected".into()
+                        );
+                    }
+                    if w.len() > 10_000 {
+                        return Err("--weights: at most 10,000 items".into());
+                    }
+                    Some(Arc::new(w))
+                }
+                None => None,
+            };
+            let items = match (&weights, a.items) {
+                (Some(w), Some(n)) if n as usize != w.len() => {
+                    return Err(format!(
+                        "--items {n} does not match the {} weights",
+                        w.len()
+                    ))
+                }
+                (Some(w), _) => w.len() as u32,
+                (None, n) => n.unwrap_or(10),
+            };
+            let weights = weights.filter(|w| !w.uniform());
+            if let Some(b) = a.budget {
+                if weights
+                    .as_ref()
+                    .is_some_and(|w| w.len() > MAX_WEIGHTED_BUDGET_ITEMS)
+                {
+                    return Err(format!(
+                        "--budget with unequal --weights is computed exactly for up to {MAX_WEIGHTED_BUDGET_ITEMS} items"
+                    ));
+                }
+                if weights.is_none() && items as u64 * b > 500_000_000 {
+                    return Err(
+                        "--items x --budget is too large to compute exactly (at most 500,000,000)"
+                            .into(),
+                    );
+                }
+            }
+            Paradox::Coupon {
+                items,
+                weights,
+                budget: a.budget,
+            }
+        }
         "secretary" => {
             let skip = match a.skip {
                 Some(k) if k >= a.candidates => {
@@ -277,18 +516,104 @@ fn paradox(a: &Args, command: &str) -> Result<Paradox, String> {
                 spacing: a.spacing,
             }
         }
+        "base-rate" => {
+            let positive =
+                a.prevalence * a.sensitivity + (1.0 - a.prevalence) * (1.0 - a.specificity);
+            if positive <= 0.0 {
+                return Err("with these values nobody ever tests positive".into());
+            }
+            Paradox::BaseRate {
+                prevalence: a.prevalence,
+                sensitivity: a.sensitivity,
+                specificity: a.specificity,
+            }
+        }
+        "penney" => {
+            let first = coins(&a.first).map_err(|e| format!("--first: {e}"))?;
+            let second = match &a.second {
+                Some(s) => coins(s).map_err(|e| format!("--second: {e}"))?,
+                None => probsim::exact::penney_best_reply(&first),
+            };
+            if first.len() != second.len() {
+                return Err("--first and --second must be the same length".into());
+            }
+            if first == second {
+                return Err("--first and --second must differ".into());
+            }
+            Paradox::Penney { first, second }
+        }
+        "boy-girl" => Paradox::BoyGirl {
+            tuesday: !a.any_day,
+        },
+        "bertrand" => Paradox::Bertrand { method: a.method },
         other => return Err(format!("unknown paradox {other:?}; see probsim list")),
     })
 }
 
-fn source(a: &Args) -> Result<Source, String> {
+/// Set a parameter by name, for a sweep; true when it is a whole number.
+fn set_param(a: &mut Args, name: &str, v: f64) -> Result<(), String> {
+    let whole = |lo: f64, hi: f64| -> Result<u64, String> {
+        if v.fract() != 0.0 || v < lo || v > hi {
+            Err(format!("{name} must be a whole number from {lo} to {hi}"))
+        } else {
+            Ok(v as u64)
+        }
+    };
+    let prob = || {
+        if (0.0..=1.0).contains(&v) {
+            Ok(v)
+        } else {
+            Err(format!("{name} must be from 0 to 1"))
+        }
+    };
+    match name {
+        "doors" => a.doors = whole(3.0, 1000.0)? as u32,
+        "people" => a.people = whole(1.0, 100_000.0)? as u32,
+        "days" => a.days = Some(whole(1.0, 100_000.0)? as u32),
+        "items" => a.items = Some(whole(1.0, 10_000.0)? as u32),
+        "budget" => a.budget = Some(whole(1.0, 100_000_000.0)?),
+        "candidates" => a.candidates = whole(1.0, 100_000.0)? as u32,
+        "skip" => a.skip = Some(whole(0.0, 100_000.0)? as u32),
+        "length" => a.length = v,
+        "spacing" => a.spacing = v,
+        "prevalence" => a.prevalence = prob()?,
+        "sensitivity" => a.sensitivity = prob()?,
+        "specificity" => a.specificity = prob()?,
+        _ => {
+            return Err(format!(
+                "--vary {name}: not a number parameter of this paradox"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn integer_param(name: &str) -> bool {
+    matches!(
+        name,
+        "doors" | "people" | "days" | "items" | "budget" | "candidates" | "skip"
+    )
+}
+
+/// Which parameters each paradox can sweep.
+fn sweepable(p: &str) -> &'static [&'static str] {
+    match p {
+        "monty-hall" => &["doors"],
+        "birthday" => &["people", "days"],
+        "coupon" | "gacha" => &["items", "budget"],
+        "secretary" => &["candidates", "skip"],
+        "buffon" => &["length", "spacing"],
+        "base-rate" => &["prevalence", "sensitivity", "specificity"],
+        _ => &[],
+    }
+}
+
+fn source(a: &Args, trials: u64) -> Result<Source, String> {
     if let Some(path) = &a.file {
         if a.source.as_deref().is_some_and(|s| s != "file") {
             return Err("--file reads your numbers; leave out --source".into());
         }
-        // Not necessarily UTF-8 (a Shift_JIS CSV, say): see benford::decode.
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
-        let text = benford::decode(&bytes).map_err(|e| format!("{path:?}: {e}"))?;
+        let text = read_file(path)?;
         let scan = match a.column {
             Some(c) => benford::scan_csv(&text, c, a.delimiter.unwrap_or(',')),
             None => benford::scan_text(&text),
@@ -300,8 +625,8 @@ fn source(a: &Args) -> Result<Source, String> {
         });
     }
     match a.source.as_deref() {
-        None | Some("powers2") => Ok(Source::PowersOfTwo(a.trials)),
-        Some("fibonacci") => Ok(Source::Fibonacci(a.trials)),
+        None | Some("powers2") => Ok(Source::PowersOfTwo(trials)),
+        Some("fibonacci") => Ok(Source::Fibonacci(trials)),
         Some("file") => Err("--source file needs --file PATH".into()),
         Some(other) => Err(format!(
             "--source must be powers2 or fibonacci, not {other:?}"
@@ -314,16 +639,35 @@ const LIST: &[(&str, &str)] = &[
         "monty-hall",
         "Switch doors or not? (also --random-host: the careless host)",
     ),
-    ("birthday", "How likely is a shared birthday in a group?"),
+    (
+        "birthday",
+        "How likely is a shared birthday in a group? (also uneven birthdays)",
+    ),
     (
         "coupon",
-        "How many draws to complete a gacha? (alias: gacha)",
+        "How many draws to complete a gacha? (alias: gacha; rates, budget)",
     ),
     (
         "secretary",
         "Hire the best candidate, deciding on the spot: the 37% rule",
     ),
     ("buffon", "Buffon's needle: estimate pi by dropping needles"),
+    (
+        "base-rate",
+        "A positive test for a rare disease: how likely are you sick?",
+    ),
+    (
+        "penney",
+        "Penney's game: the second player can always pick a better sequence",
+    ),
+    (
+        "boy-girl",
+        "Two children, one a boy born on a Tuesday: both boys?",
+    ),
+    (
+        "bertrand",
+        "Bertrand's paradox: three ways to draw a random chord, three answers",
+    ),
     (
         "benford",
         "Why 1 leads 30% of the time: Benford's law, also on your own data",
@@ -332,7 +676,7 @@ const LIST: &[(&str, &str)] = &[
 
 /// Too few trials to judge, under --check.
 fn undecided(what: &str) -> String {
-    format!("--check cannot judge {what}: too few trials (an average needs at least 30; benford needs 110 numbers)")
+    format!("--check cannot judge {what}: too few trials (an average needs at least 30; benford needs enough numbers)")
 }
 
 fn run(a: Args) -> Result<ExitCode, String> {
@@ -351,6 +695,9 @@ fn run(a: Args) -> Result<ExitCode, String> {
             a.command
         ));
     }
+    if a.json && a.csv {
+        return Err("choose --json or --csv, not both".into());
+    }
     let opt = TextOptions {
         lang,
         chart: a.chart,
@@ -366,9 +713,25 @@ fn run(a: Args) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        "play" => {
+            if a.target.as_deref() != Some("monty-hall") {
+                return Err("play supports monty-hall: probsim play monty-hall".into());
+            }
+            // The standard output lock is reentrant, so the game can take it too.
+            let stdin = std::io::stdin();
+            probsim::play::monty_hall(
+                a.doors,
+                seed,
+                lang,
+                &mut stdin.lock(),
+                &mut std::io::stdout().lock(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(ExitCode::SUCCESS)
+        }
         "benford" => {
-            let src = source(&a)?;
-            let analysis = benford::analyze(src.counts());
+            let src = source(&a, a.trials.unwrap_or(100_000))?;
+            let analysis = benford::analyze(src.counts(a.digits), a.digits);
             if analysis.total == 0 {
                 return Err("no nonzero numbers found".into());
             }
@@ -387,20 +750,111 @@ fn run(a: Args) -> Result<ExitCode, String> {
                 None => Err(undecided("benford")),
             }
         }
+        "sweep" => {
+            let target = a
+                .target
+                .clone()
+                .ok_or("sweep needs a paradox: probsim sweep birthday --vary people ...")?;
+            let name = a.vary.clone().ok_or("sweep needs --vary NAME")?;
+            if !sweepable(&target).contains(&name.as_str()) {
+                let options = sweepable(&target);
+                return Err(if options.is_empty() {
+                    format!("{target} has no number parameter to sweep")
+                } else {
+                    format!("--vary for {target} must be one of: {}", options.join(", "))
+                });
+            }
+            let (from, to) = (
+                a.from.ok_or("sweep needs --from")?,
+                a.to.ok_or("sweep needs --to")?,
+            );
+            let integer = integer_param(&name);
+            let steps = if a.steps > 0 {
+                a.steps
+            } else if integer && (to - from).abs() < 40.0 {
+                (to - from).abs() as usize + 1
+            } else {
+                21
+            };
+            let values = study::sweep_values(from, to, steps, integer);
+            let trials = a.trials.unwrap_or(10_000);
+            let make = |v: f64| -> Result<Paradox, String> {
+                let mut b = a.clone();
+                set_param(&mut b, &name, v)?;
+                paradox(&b, &target)
+            };
+            let pts = study::sweep(&values, make, trials, seed)?;
+            let text = if a.json {
+                sweep_json(&pts, &name, seed) + "\n"
+            } else if a.csv {
+                let mut s = format!("{name},exact,estimate,ci_low,ci_high\n");
+                for p in &pts {
+                    let (lo, hi) = p
+                        .outcome
+                        .ci95
+                        .map_or((String::new(), String::new()), |(l, h)| {
+                            (l.to_string(), h.to_string())
+                        });
+                    s += &format!(
+                        "{},{},{},{lo},{hi}\n",
+                        p.value, p.outcome.theory, p.outcome.estimate
+                    );
+                }
+                s
+            } else {
+                sweep_report(&pts, &name, &opt)
+                    + &match lang {
+                        Lang::En => {
+                            format!("seed {seed} (each point gets its own stream from it)\n")
+                        }
+                        Lang::Ja => format!("seed {seed}(各点はここから導いた別々の乱数列)\n"),
+                    }
+            };
+            write(&text)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "coverage" => {
+            let target = a
+                .target
+                .clone()
+                .ok_or("coverage needs a paradox: probsim coverage monty-hall")?;
+            if target == "benford" {
+                return Err("coverage needs a simulated paradox, not benford".into());
+            }
+            let p = paradox(&a, &target)?;
+            let trials = a.trials.unwrap_or(1_000);
+            let runs = study::coverage(&p, a.runs, trials, seed);
+            let text = if a.json {
+                coverage_json(&p, &runs, a.runs, trials) + "\n"
+            } else if a.csv {
+                let mut s = String::from("seed,estimate,ci_low,ci_high,hit\n");
+                for r in &runs {
+                    s += &format!(
+                        "{},{},{},{},{}\n",
+                        r.seed, r.estimate, r.interval.0, r.interval.1, r.hit
+                    );
+                }
+                s
+            } else {
+                coverage_report(&p, &runs, a.runs, trials, &opt)
+            };
+            write(&text)?;
+            Ok(ExitCode::SUCCESS)
+        }
         "all" => {
-            let commands = ["monty-hall", "birthday", "coupon", "secretary", "buffon"];
+            let trials = a.trials.unwrap_or(100_000);
             let mut outcomes = Vec::new();
-            for (i, c) in commands.iter().enumerate() {
+            for (i, c) in SIMS.iter().enumerate() {
                 // Each paradox gets its own random stream, derived from the seed.
                 outcomes.push(simulate(
                     &paradox(&a, c)?,
-                    a.trials,
+                    trials,
                     derived_seed(seed, i as u64),
                     points,
                 ));
             }
-            let src = Source::PowersOfTwo(a.trials);
-            let analysis = benford::analyze(src.counts());
+            let src = Source::PowersOfTwo(trials);
+            let analysis = benford::analyze(src.counts(1), 1);
             let text = if a.json {
                 format!(
                     "{{\"seed\":{seed},\"results\":[{}],\"benford\":{}}}\n",
@@ -416,11 +870,11 @@ fn run(a: Args) -> Result<ExitCode, String> {
                     + &match lang {
                         Lang::En => format!(
                             "\n{} trials each, seed {seed} (each paradox gets its own stream from it; see --json)\n",
-                            probsim::output::grouped(a.trials)
+                            probsim::output::grouped(trials)
                         ),
                         Lang::Ja => format!(
                             "\n各{}回、seed {seed}(各パラドックスはここから導いた別々の乱数列。--jsonに各seedを出力)\n",
-                            probsim::output::grouped(a.trials)
+                            probsim::output::grouped(trials)
                         ),
                     }
             };
@@ -447,22 +901,34 @@ fn run(a: Args) -> Result<ExitCode, String> {
         }
         c => {
             let p = paradox(&a, c)?;
+            let trials = a.trials.unwrap_or(100_000);
             // --explain replays the first trials of the same seed with their
             // stories; the simulation below repeats them and goes on.
             let mut stories = Vec::new();
             if a.explain > 0 {
                 let mut rng = Rng::new(seed);
                 let mut scratch = Vec::new();
-                for _ in 0..a.explain.min(a.trials.min(u32::MAX as u64) as u32) {
+                for _ in 0..(a.explain as u64).min(trials) {
                     stories.push(p.explain(&mut rng, &mut scratch, lang));
                 }
             }
-            let o: Outcome = simulate(&p, a.trials, seed, points);
+            let o: Outcome = simulate(&p, trials, seed, points);
             if o.counted == 0 {
                 return Err("no trial counted; run more trials".into());
             }
+            if let Some(path) = &a.svg {
+                let title = format!(
+                    "{} ({}, seed {seed})",
+                    p.texts(lang).title,
+                    p.texts(lang).quantity
+                );
+                std::fs::write(path, export::svg(&o, &title))
+                    .map_err(|e| format!("cannot write {path:?}: {e}"))?;
+            }
             let text = if a.json {
                 outcome_json(&o, &stories) + "\n"
+            } else if a.csv {
+                export::csv(&o)
             } else {
                 let mut t = report(&o, &opt);
                 if !stories.is_empty() {

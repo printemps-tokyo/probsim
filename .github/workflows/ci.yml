@@ -36,7 +36,12 @@ jobs:
           b=./target/release/probsim
           for args in "all --trials 2000 --seed 1" "monty-hall --random-host --explain 3 --trials 500" \
                       "coupon --trials 3" "buffon --trials 1" "birthday --people 1 --trials 10" \
-                      "benford --trials 50" "benford --source fibonacci --trials 5000"; do
+                      "benford --trials 50" "benford --source fibonacci --trials 5000" \
+                      "benford --digits 2 --trials 5000" "base-rate --explain 2 --trials 500" \
+                      "penney --trials 500" "boy-girl --trials 500" "bertrand --method radius --trials 500" \
+                      "gacha --weights 1,1,0.2 --budget 20 --trials 500" \
+                      "sweep birthday --vary people --from 1 --to 30 --trials 500" \
+                      "coverage monty-hall --runs 20 --trials 100"; do
             $b $args --json | python3 -m json.tool > /dev/null
           done
 

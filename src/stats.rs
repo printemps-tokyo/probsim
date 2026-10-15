@@ -155,3 +155,33 @@ pub fn gamma_q(a: f64, x: f64) -> f64 {
 pub fn chi_square_p(stat: f64, df: u32) -> f64 {
     gamma_q(df as f64 / 2.0, stat / 2.0).clamp(0.0, 1.0)
 }
+
+/// The central range of a Binomial(n, p) count holding at least `level` of
+/// its probability (the smallest k with P(X <= k) > (1 - level) / 2 up to the
+/// largest with P(X >= k) > (1 - level) / 2), from the probabilities
+/// computed in logs.
+pub fn binomial_central(n: u64, p: f64, level: f64) -> (u64, u64) {
+    let tail = (1.0 - level) / 2.0;
+    let ln_pmf = |k: u64| {
+        ln_gamma(n as f64 + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma((n - k) as f64 + 1.0)
+            + k as f64 * p.ln()
+            + (n - k) as f64 * (1.0 - p).ln()
+    };
+    let (mut acc, mut lo) = (0.0, 0);
+    for k in 0..=n {
+        acc += ln_pmf(k).exp();
+        if acc > tail {
+            lo = k;
+            break;
+        }
+    }
+    let (mut acc, mut hi) = (0.0, n);
+    for k in (0..=n).rev() {
+        acc += ln_pmf(k).exp();
+        if acc > tail {
+            hi = k;
+            break;
+        }
+    }
+    (lo, hi)
+}

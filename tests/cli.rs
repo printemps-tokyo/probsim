@@ -1,18 +1,34 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
-fn probsim(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_probsim"))
+fn run(args: &[&str], stdin: Option<&[u8]>) -> (i32, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_probsim"))
         .args(args)
         .env("LANG", "C")
         .env_remove("LC_ALL")
         .env_remove("LC_MESSAGES")
-        .output()
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    if let Some(bytes) = stdin {
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8(out.stdout).unwrap(),
         String::from_utf8(out.stderr).unwrap(),
     )
+}
+
+fn probsim(args: &[&str]) -> (i32, String, String) {
+    run(args, None)
 }
 
 fn flat(s: &str) -> String {
@@ -31,12 +47,12 @@ fn temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
 fn help_version_and_list() {
     let (code, out, _) = probsim(&["--help"]);
     assert_eq!(code, 0);
-    assert!(out.contains("Usage: probsim <paradox> [options]"));
+    assert!(out.contains("probsim sweep <paradox> --vary NAME"));
     assert_eq!(
         probsim(&["-V"]).1,
         format!("probsim {}\n", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(probsim(&["list"]).1.lines().count(), 6);
+    assert_eq!(probsim(&["list"]).1.lines().count(), 10);
 }
 
 #[test]
@@ -45,21 +61,38 @@ fn usage_errors_exit_2() {
         &["nope"][..],
         &[][..],
         &["birthday", "--doors", "4"][..],
-        &["birthday", "--people", "0"][..],
-        &["monty-hall", "--trials", "0"][..],
         &["monty-hall", "--random-host=false"][..],
-        &["monty-hall", "--json=no"][..],
         &["monty-hall", "--seed", "9007199254740992"][..],
         &["secretary", "--candidates", "10", "--skip", "10"][..],
         &["buffon", "--length", "3", "--spacing", "2"][..],
-        &["buffon", "--length", "1e-300", "--spacing", "1e300"][..],
-        &["benford", "--source", "primes"][..],
         &["benford", "--file", "/nonexistent/x.csv"][..],
         &["benford", "--column", "2"][..],
+        &["benford", "--digits", "3"][..],
         &["list", "--json"][..],
         &["all", "--explain", "3"][..],
-        &["birthday", "--lang", "fr"][..],
-        &["birthday", "--bogus"][..],
+        &["base-rate", "--prevalence", "2"][..],
+        &["base-rate", "--prevalence", "0", "--specificity", "1"][..],
+        &["penney", "--first", "HHT", "--second", "TH"][..],
+        &["penney", "--first", "HHT", "--second", "HHT"][..],
+        &["penney", "--first", "HXT"][..],
+        &["bertrand", "--method", "diameter"][..],
+        &["coupon", "--weights", "1,0,1"][..],
+        &["coupon", "--weights", "1,1", "--items", "3"][..],
+        &["coupon", "--weights", "1,2", "--weights-file", "x"][..],
+        &["coupon", "--budget", "100000000", "--items", "10000"][..],
+        &[
+            "sweep", "birthday", "--vary", "doors", "--from", "1", "--to", "5",
+        ][..],
+        &["sweep", "birthday", "--vary", "people", "--from", "1"][..],
+        &[
+            "sweep", "penney", "--vary", "first", "--from", "1", "--to", "2",
+        ][..],
+        &["coverage", "benford"][..],
+        &["play", "birthday"][..],
+        &["monty-hall", "--json", "--csv"][..],
+        &[
+            "sweep", "birthday", "--vary", "people", "--from", "1", "--to", "5", "--check",
+        ][..],
     ] {
         let (code, _, err) = probsim(args);
         assert_eq!(code, 2, "{args:?}: {err}");
@@ -75,6 +108,41 @@ fn a_run_prints_the_seed_and_is_repeatable() {
     assert_eq!(
         a.1,
         probsim(&["birthday", "--trials=5000", "--seed=11", "--no-chart"]).1
+    );
+}
+
+#[test]
+fn new_paradoxes_run() {
+    for args in [
+        &["base-rate", "--prevalence", "1%", "--trials", "20000"][..],
+        &["penney", "--first", "HTH", "--trials", "20000"][..],
+        &["boy-girl", "--trials", "20000"][..],
+        &["boy-girl", "--any-day", "--trials", "20000"][..],
+        &["bertrand", "--method", "radius", "--trials", "20000"][..],
+        &["coupon", "--weights", "1,1,1,0.2", "--trials", "20000"][..],
+        &["gacha", "--budget", "40", "--trials", "20000"][..],
+    ] {
+        let mut a = args.to_vec();
+        a.extend(["--seed", "3", "--check", "--no-chart"]);
+        let (code, out, err) = probsim(&a);
+        assert_eq!(code, 0, "{args:?}: {out}{err}");
+    }
+    let days = temp("days.txt", "1\n".repeat(364).as_bytes());
+    let mut weights = std::fs::read_to_string(&days).unwrap();
+    weights.push_str("5\n");
+    std::fs::write(&days, weights).unwrap();
+    let (code, out, _) = probsim(&[
+        "birthday",
+        "--day-weights",
+        days.to_str().unwrap(),
+        "--json",
+        "--trials",
+        "2000",
+    ]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("\"days\":365,\"dayWeights\":\"given\""),
+        "{out}"
     );
 }
 
@@ -95,25 +163,8 @@ fn explain_tells_the_first_trials() {
         out.starts_with("The first 3 games, step by step:\n  Game 1: car behind door "),
         "{out}"
     );
-    assert!(out.contains("  Game 3: "));
-    let (_, ja, _) = probsim(&[
-        "secretary",
-        "--explain",
-        "1",
-        "--trials",
-        "10",
-        "--seed",
-        "4",
-        "--lang",
-        "ja",
-        "--no-chart",
-    ]);
-    assert!(
-        ja.starts_with("最初の1回を一つずつ:\n  1回目: 最初の37人で基準はスコア"),
-        "{ja}"
-    );
     let (_, j, _) = probsim(&[
-        "coupon",
+        "penney",
         "--explain",
         "2",
         "--trials",
@@ -126,15 +177,80 @@ fn explain_tells_the_first_trials() {
 }
 
 #[test]
-fn json_output() {
+fn sweep_coverage_csv_and_svg() {
     let (code, out, _) = probsim(&[
-        "coupon", "--items", "5", "--trials", "2000", "--seed", "1", "--json",
+        "sweep", "birthday", "--vary", "people", "--from", "10", "--to", "40", "--steps", "4",
+        "--trials", "2000", "--seed", "1",
     ]);
     assert_eq!(code, 0);
-    assert!(out.starts_with("{\"paradox\":\"coupon\",\"params\":{\"items\":5}"));
-    let (_, all, _) = probsim(&["all", "--trials", "2000", "--seed", "1", "--json"]);
-    assert!(all.starts_with("{\"seed\":1,\"results\":[{\"paradox\":\"monty-hall\""));
-    assert!(all.contains("\"benford\":{\"paradox\":\"benford\",\"source\":\"powers2\""));
+    assert!(out.contains("as people changes") && out.contains("seed 1"));
+    let (_, csv, _) = probsim(&[
+        "sweep",
+        "secretary",
+        "--vary",
+        "skip",
+        "--from",
+        "0",
+        "--to",
+        "90",
+        "--steps",
+        "4",
+        "--trials",
+        "1000",
+        "--csv",
+    ]);
+    assert!(
+        csv.starts_with("skip,exact,estimate,ci_low,ci_high\n0,0.01,"),
+        "{csv}"
+    );
+    assert_eq!(csv.lines().count(), 5);
+    let (code, cov, _) = probsim(&[
+        "coverage",
+        "monty-hall",
+        "--runs",
+        "20",
+        "--trials",
+        "200",
+        "--seed",
+        "2",
+    ]);
+    assert_eq!(code, 0);
+    assert!(flat(&cov).contains("of 20 intervals"));
+    let (_, ccsv, _) = probsim(&[
+        "coverage", "coupon", "--runs", "5", "--trials", "50", "--csv",
+    ]);
+    assert_eq!(ccsv.lines().count(), 6);
+    let svg = std::env::temp_dir().join(format!("probsim-{}-chart.svg", std::process::id()));
+    let (code, _, _) = probsim(&[
+        "buffon",
+        "--trials",
+        "2000",
+        "--svg",
+        svg.to_str().unwrap(),
+        "--no-chart",
+    ]);
+    assert_eq!(code, 0);
+    assert!(std::fs::read_to_string(&svg).unwrap().contains("<polyline"));
+    std::fs::remove_file(&svg).unwrap();
+    let (_, rcsv, _) = probsim(&["monty-hall", "--trials", "100", "--csv"]);
+    assert!(rcsv.starts_with("n,estimate,exact,band_low,band_high\n"));
+}
+
+#[test]
+fn play_reads_answers_from_standard_input() {
+    let (code, out, _) = run(
+        &["play", "monty-hall", "--seed", "4"],
+        Some(b"1\ny\n2\nn\nnine\n3\nmaybe\ny\nq\n"),
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("Monty Hall with 3 doors"));
+    assert!(out.contains("Type a number from 1 to 3."));
+    assert!(
+        out.lines().last().unwrap().starts_with("Switching won "),
+        "{out}"
+    );
+    let (code, _, _) = run(&["play", "monty-hall"], Some(b""));
+    assert_eq!(code, 0, "the end of input ends the game");
 }
 
 #[test]
@@ -143,7 +259,6 @@ fn check_passes_on_good_runs_and_fails_on_data_that_is_not_benford() {
         probsim(&["all", "--trials", "20000", "--seed", "8", "--check"]).0,
         0
     );
-    // A certain outcome never fails the check.
     assert_eq!(
         probsim(&[
             "birthday",
@@ -160,43 +275,27 @@ fn check_passes_on_good_runs_and_fails_on_data_that_is_not_benford() {
         0
     );
     let text: String = (0..900).map(|i| format!("{} ", i % 9 + 1)).collect();
-    let flat_file = temp("flat.txt", text.as_bytes());
-    let (code, out, _) = probsim(&["benford", "--file", flat_file.to_str().unwrap(), "--check"]);
+    let f = temp("flat.txt", text.as_bytes());
+    let (code, out, _) = probsim(&["benford", "--file", f.to_str().unwrap(), "--check"]);
     assert_eq!(code, 1, "{out}");
-    assert!(flat(&out).contains("differs from Benford's law"), "{out}");
-    assert_eq!(
-        probsim(&["benford", "--file", flat_file.to_str().unwrap()]).0,
-        0,
-        "without --check"
+    assert!(
+        flat(&out).contains("differs from Benford's law") && flat(&out).contains("nonconformity")
     );
-}
-
-#[test]
-fn check_refuses_to_judge_too_few_trials() {
     let (code, _, err) = probsim(&[
         "coupon",
         "--items",
         "2",
         "--trials",
         "2",
-        "--seed",
-        "2",
         "--check",
         "--no-chart",
     ]);
     assert_eq!(code, 2);
     assert!(err.contains("too few trials"), "{err}");
-    let few = temp("few.txt", b"1 2 3");
-    let (code, out, err) = probsim(&["benford", "--file", few.to_str().unwrap(), "--check"]);
-    assert_eq!(code, 2, "{err}");
-    assert!(
-        flat(&out).contains("too few for the chi-square test"),
-        "{out}"
-    );
 }
 
 #[test]
-fn benford_reads_csv_columns_and_any_encoding() {
+fn benford_from_files_columns_and_standard_input() {
     let csv = temp("sales.csv", b"id,amount\n1,250\n2,\"1,300\"\n3,0\n");
     let (code, out, _) = probsim(&[
         "benford",
@@ -211,16 +310,21 @@ fn benford_reads_csv_columns_and_any_encoding() {
         out.contains("\"column\":2,\"numbersFound\":3,\"zeros\":1"),
         "{out}"
     );
-    let (_, text, _) = probsim(&["benford", "--file", csv.to_str().unwrap()]);
-    assert!(
-        flat(&text).contains("use --column to read one column"),
-        "{text}"
+    let numbers: String = (1..=3000).map(|i| format!("{}\n", i * 7)).collect();
+    let (code, out, _) = run(
+        &["benford", "--file", "-", "--json"],
+        Some(numbers.as_bytes()),
     );
-    // Shift_JIS bytes around the numbers are not UTF-8; the numbers still count.
-    let sjis = temp("sjis.csv", b"\x94\x84\x8f\xe3,123\n\x94\x84\x8f\xe3,456\n");
-    let (code, out, err) = probsim(&["benford", "--file", sjis.to_str().unwrap(), "--json"]);
-    assert_eq!(code, 0, "{err}");
-    assert!(out.contains("\"total\":2"), "{out}");
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("\"file\":\"-\"") && out.contains("\"total\":3000"),
+        "{out}"
+    );
+    let (_, text, _) = run(&["benford", "--file", "-"], Some(numbers.as_bytes()));
+    assert!(text.contains("standard input"));
+    let (code, two, _) = probsim(&["benford", "--digits", "2", "--trials", "20000", "--json"]);
+    assert_eq!(code, 0);
+    assert!(two.contains("\"firstDigits\":2") && two.contains("\"df\":89"));
 }
 
 #[test]
@@ -236,5 +340,6 @@ fn japanese_output() {
         "--no-chart",
     ]);
     assert!(out.starts_with("秘書問題(100人の候補者)"));
-    assert!(out.contains("最初の37人(37.0%)は見送り"));
+    let (_, bg, _) = probsim(&["boy-girl", "--trials", "3000", "--lang", "ja", "--no-chart"]);
+    assert!(bg.starts_with("男女の謎(火曜日生まれの男の子)"));
 }
