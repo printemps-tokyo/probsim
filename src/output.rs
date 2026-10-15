@@ -1161,7 +1161,8 @@ pub fn outcome_json(o: &Outcome, stories: &[(Option<f64>, String)]) -> String {
         o.seed,
         o.attempted,
         o.counted,
-        json_num(o.estimate),
+        // No estimate where nothing counted (no trial matched the condition).
+        if o.counted == 0 { "null".to_string() } else { json_num(o.estimate) },
         json_num(o.standard_error),
         json_pair(o.ci95),
         json_num(o.theory),

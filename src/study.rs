@@ -2,7 +2,7 @@
 //! that show what "95% confidence" means.
 
 use crate::paradox::Paradox;
-use crate::sim::{derived_seed, simulate, Outcome};
+use crate::sim::{derived_seed, simulate, simulate_known, Outcome};
 use crate::stats::Z95;
 
 /// The values a sweep takes: `steps` evenly spaced values from `from` to
@@ -61,10 +61,12 @@ pub struct Run {
 /// 95% intervals contain the exact answer. Runs whose interval cannot be
 /// given (an average from fewer than 30 trials) are left out.
 pub fn coverage(p: &Paradox, runs: u64, trials: u64, seed: u64) -> Vec<Run> {
+    // The exact answer once, not once per run.
+    let theory = p.theory();
     (0..runs)
         .filter_map(|i| {
             let s = derived_seed(seed, i);
-            let o = simulate(p, trials, s, 2);
+            let o = simulate_known(p, theory, trials, s, 2);
             let interval = o.interval(Z95)?;
             Some(Run {
                 seed: s,

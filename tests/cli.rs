@@ -431,3 +431,69 @@ fn play_explains_bad_answers_and_prints_the_seed() {
         "{out}"
     );
 }
+
+#[test]
+fn round_two_edge_cases() {
+    // A huge budget costs only the draws it takes.
+    assert_eq!(
+        probsim(&[
+            "gacha",
+            "--items",
+            "1",
+            "--budget",
+            "100000000",
+            "--trials",
+            "1000",
+            "--json"
+        ])
+        .0,
+        0
+    );
+    // Nothing counted: the JSON estimate is null.
+    let (_, out, _) = probsim(&[
+        "sweep",
+        "base-rate",
+        "--vary",
+        "prevalence",
+        "--from",
+        "1e-100",
+        "--to",
+        "2e-100",
+        "--specificity",
+        "1",
+        "--trials",
+        "1",
+        "--steps",
+        "2",
+        "--json",
+    ]);
+    assert!(out.contains("\"counted\":0,\"estimate\":null"), "{out}");
+    // Empty or invalid sweep ranges are errors.
+    for range in [["NaN", "10"], ["1.1", "1.2"]] {
+        let (code, _, err) = probsim(&[
+            "sweep", "birthday", "--vary", "people", "--from", range[0], "--to", range[1],
+        ]);
+        assert_eq!(code, 2, "{range:?}: {err}");
+    }
+    // The suggested --trials is per run and can be pasted.
+    let (_, _, err) = probsim(&[
+        "coverage",
+        "gacha",
+        "--weights",
+        "1,1e-6",
+        "--runs",
+        "100",
+        "--trials",
+        "1000",
+    ]);
+    let suggested: u64 = err
+        .split("--trials ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(suggested < 1000, "{err}");
+}

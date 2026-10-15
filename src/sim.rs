@@ -92,6 +92,12 @@ pub fn derived_seed(seed: u64, i: u64) -> u64 {
 /// trials. When some trials may not count, a first pass with the same seed
 /// finds how many will, so the checkpoints still spread over the whole run.
 pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
+    simulate_known(p, p.theory(), trials, seed, points)
+}
+
+/// `simulate` with the exact answer already computed, for studies that run
+/// the same paradox many times.
+pub fn simulate_known(p: &Paradox, theory: f64, trials: u64, seed: u64, points: usize) -> Outcome {
     let mut scratch = Vec::new();
     let counted_total = if p.may_reject() {
         let mut rng = Rng::new(seed);
@@ -153,7 +159,7 @@ pub fn simulate(p: &Paradox, trials: u64, seed: u64, points: usize) -> Outcome {
         estimate: est,
         standard_error,
         ci95: None,
-        theory: p.theory(),
+        theory,
         checkpoints,
     };
     o.ci95 = o.interval(Z95);

@@ -706,9 +706,19 @@ fn undecided(what: &str) -> String {
 /// takes, to refuse one that would run for a very long time.
 fn work(p: &Paradox, trials: u64) -> f64 {
     let per_trial = match p {
+        // A collector stops when complete, so a large budget costs no more
+        // than the draws it takes on average.
         Paradox::Coupon {
-            budget: Some(b), ..
-        } => *b as f64,
+            items,
+            weights,
+            budget: Some(b),
+        } => {
+            let mean = match weights {
+                Some(w) => w.coupon_mean().unwrap_or(*b as f64),
+                None => probsim::exact::coupon_mean_equal(*items),
+            };
+            (*b as f64).min(mean)
+        }
         Paradox::Coupon { .. } => p.theory(),
         Paradox::Birthday { people, .. } => *people as f64,
         Paradox::Secretary { candidates, .. } => *candidates as f64,
@@ -722,13 +732,15 @@ fn work(p: &Paradox, trials: u64) -> f64 {
 /// About a minute of simulation on an ordinary machine.
 const MAX_WORK: f64 = 2e10;
 
-fn affordable(p: &Paradox, trials: u64) -> Result<(), String> {
-    let w = work(p, trials);
+/// Refuse a run of `runs` x `trials` that would take too long, suggesting
+/// a --trials (per run) that fits, as a plain number ready to paste.
+fn affordable(p: &Paradox, trials: u64, runs: u64) -> Result<(), String> {
+    let w = work(p, trials) * runs as f64;
     if w > MAX_WORK {
-        let suggest = ((MAX_WORK / (w / trials as f64)).floor() as u64).max(1);
+        let per_trial = w / (trials as f64 * runs as f64);
+        let suggest = ((MAX_WORK / (per_trial * runs as f64)).floor() as u64).max(1);
         return Err(format!(
-            "this would take about {w:.0e} steps; use --trials {} or fewer",
-            probsim::output::grouped(suggest)
+            "this would take about {w:.0e} steps; use --trials {suggest} or fewer"
         ));
     }
     Ok(())
@@ -839,13 +851,19 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
             } else {
                 21
             };
+            if !(from.is_finite() && to.is_finite()) {
+                return Err("--from and --to must be numbers".into());
+            }
             let values = study::sweep_values(from, to, steps, integer);
+            if values.is_empty() {
+                return Err(format!("no value of {name} lies between {from} and {to}"));
+            }
             let trials = a.trials.unwrap_or(10_000);
             let make = |v: f64| -> Result<Paradox, String> {
                 let mut b = a.clone();
                 set_param(&mut b, &name, v)?;
                 let p = paradox(&b, &target)?;
-                affordable(&p, trials)?;
+                affordable(&p, trials, 1)?;
                 Ok(p)
             };
             let pts = study::sweep(&values, make, trials, seed)?;
@@ -894,7 +912,7 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
             }
             let p = paradox(&a, &target)?;
             let trials = a.trials.unwrap_or(1_000);
-            affordable(&p, trials.saturating_mul(a.runs))?;
+            affordable(&p, trials, a.runs)?;
             let runs = study::coverage(&p, a.runs, trials, seed);
             if runs.is_empty() {
                 return Err(format!(
@@ -926,7 +944,7 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
             for (i, c) in SIMS.iter().enumerate() {
                 // Each paradox gets its own random stream, derived from the seed.
                 let p = paradox(&a, c)?;
-                affordable(&p, trials)?;
+                affordable(&p, trials, 1)?;
                 outcomes.push(simulate(&p, trials, derived_seed(seed, i as u64), points));
             }
             let src = Source::PowersOfTwo(trials);
@@ -978,7 +996,7 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
         c => {
             let p = paradox(&a, c)?;
             let trials = a.trials.unwrap_or(100_000);
-            affordable(&p, trials)?;
+            affordable(&p, trials, 1)?;
             // --explain replays the first trials of the same seed with their
             // stories; the simulation below repeats them and goes on.
             let mut stories = Vec::new();
