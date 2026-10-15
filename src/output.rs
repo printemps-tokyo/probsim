@@ -470,7 +470,7 @@ pub fn report(o: &Outcome, opt: &TextOptions) -> String {
             Lang::Ja => format!("{}: {}({}数、対数目盛り)", l.convergence, t.quantity, unit),
         };
         let _ = writeln!(s, "\n{title}");
-        let sd = o.paradox.theory_variance().sqrt();
+        let sd = o.variance().sqrt();
         for line in chart(&o.checkpoints, o.theory, m, opt.width, 11, Some(sd)) {
             let _ = writeln!(s, "  {line}");
         }

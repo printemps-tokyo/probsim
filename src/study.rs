@@ -27,25 +27,43 @@ pub struct SweepPoint {
     pub outcome: Outcome,
 }
 
-/// Simulate the paradox `make` builds for each value, each with its own
-/// random stream derived from `seed`.
+/// Build the paradox for each value first, so a bad value is reported
+/// (with the value) before anything runs.
+pub fn prepare(
+    values: &[f64],
+    make: impl Fn(f64) -> Result<Paradox, String>,
+) -> Result<Vec<(f64, Paradox)>, String> {
+    values
+        .iter()
+        .map(|&v| {
+            make(v)
+                .map(|p| (v, p))
+                .map_err(|e| format!("at {}: {e}", crate::paradox::num(v)))
+        })
+        .collect()
+}
+
+/// Simulate each prepared point, each with its own random stream derived
+/// from `seed`.
+pub fn run_sweep(points: &[(f64, Paradox)], trials: u64, seed: u64) -> Vec<SweepPoint> {
+    points
+        .iter()
+        .enumerate()
+        .map(|(i, (value, p))| SweepPoint {
+            value: *value,
+            outcome: simulate(p, trials, derived_seed(seed, i as u64), 2),
+        })
+        .collect()
+}
+
+/// `prepare` and `run_sweep` together.
 pub fn sweep(
     values: &[f64],
     make: impl Fn(f64) -> Result<Paradox, String>,
     trials: u64,
     seed: u64,
 ) -> Result<Vec<SweepPoint>, String> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, &value)| {
-            let p = make(value).map_err(|e| format!("at {}: {e}", crate::paradox::num(value)))?;
-            Ok(SweepPoint {
-                value,
-                outcome: simulate(&p, trials, derived_seed(seed, i as u64), 2),
-            })
-        })
-        .collect()
+    Ok(run_sweep(&prepare(values, make)?, trials, seed))
 }
 
 /// One run of a coverage study: its 95% interval and estimate.

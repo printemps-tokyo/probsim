@@ -862,11 +862,21 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
             let make = |v: f64| -> Result<Paradox, String> {
                 let mut b = a.clone();
                 set_param(&mut b, &name, v)?;
-                let p = paradox(&b, &target)?;
-                affordable(&p, trials, 1)?;
-                Ok(p)
+                paradox(&b, &target)
             };
-            let pts = study::sweep(&values, make, trials, seed)?;
+            // Every point is built and the whole sweep's cost checked before
+            // anything runs.
+            let prepared = study::prepare(&values, make)?;
+            let total: f64 = prepared.iter().map(|(_, p)| work(p, trials)).sum();
+            if total > MAX_WORK {
+                let per_trial = total / (trials as f64 * prepared.len() as f64);
+                let suggest =
+                    ((MAX_WORK / (per_trial * prepared.len() as f64)).floor() as u64).max(1);
+                return Err(format!(
+                    "this sweep would take about {total:.0e} steps; use --trials {suggest} or fewer (per point)"
+                ));
+            }
+            let pts = study::run_sweep(&prepared, trials, seed);
             let text = if a.json {
                 sweep_json(&pts, &name, seed) + "\n"
             } else if a.csv {

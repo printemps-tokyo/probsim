@@ -49,6 +49,16 @@ impl Outcome {
         }
     }
 
+    /// The exact variance of one trial, from the exact answer already
+    /// computed: p(1 - p) for a probability; for an average, the paradox's own
+    /// (NaN when not known).
+    pub fn variance(&self) -> f64 {
+        match self.paradox.measure() {
+            Measure::Probability => self.theory * (1.0 - self.theory),
+            Measure::Mean => self.paradox.theory_variance(),
+        }
+    }
+
     /// Whether the exact answer is inside the interval at confidence z, or
     /// None when there is no interval to judge by.
     pub fn consistent(&self, z: f64) -> Option<bool> {

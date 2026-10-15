@@ -9,7 +9,11 @@ use crate::stats::{MIN_FOR_MEAN, Z95};
 /// The exact +- 1.96 sd / sqrt(n) band at n, where its normal approximation
 /// holds (n p and n (1 - p) >= 5 for a probability, 30 trials for an average).
 pub fn band(o: &Outcome, n: u64) -> Option<(f64, f64)> {
-    let sd = o.paradox.theory_variance().sqrt();
+    band_with(o, o.variance().sqrt(), n)
+}
+
+/// `band` with the standard deviation of one trial already computed.
+fn band_with(o: &Outcome, sd: f64, n: u64) -> Option<(f64, f64)> {
     let nf = n as f64;
     let holds = match o.paradox.measure() {
         Measure::Probability => nf * o.theory >= 5.0 && nf * (1.0 - o.theory) >= 5.0,
@@ -23,9 +27,10 @@ pub fn band(o: &Outcome, n: u64) -> Option<(f64, f64)> {
 
 /// Checkpoints as CSV: n, estimate, exact, band_low, band_high.
 pub fn csv(o: &Outcome) -> String {
+    let sd = o.variance().sqrt();
     let mut s = String::from("n,estimate,exact,band_low,band_high\n");
     for c in &o.checkpoints {
-        let (lo, hi) = band(o, c.n).map_or((String::new(), String::new()), |(l, h)| {
+        let (lo, hi) = band_with(o, sd, c.n).map_or((String::new(), String::new()), |(l, h)| {
             (l.to_string(), h.to_string())
         });
         let _ = writeln!(s, "{},{},{},{},{}", c.n, c.estimate, o.theory, lo, hi);
@@ -43,6 +48,7 @@ fn xml(s: &str) -> String {
 /// The convergence chart as a standalone SVG: the running estimate on a log
 /// scale of trials, the exact answer, and the band where it holds.
 pub fn svg(o: &Outcome, title: &str, lang: crate::paradox::Lang) -> String {
+    let sd = o.variance().sqrt();
     let (w, h) = (720.0, 400.0);
     let (left, right, top, bottom) = (70.0, 20.0, 40.0, 50.0);
     let pts = &o.checkpoints;
@@ -91,7 +97,7 @@ pub fn svg(o: &Outcome, title: &str, lang: crate::paradox::Lang) -> String {
     // The band, as a polygon over the checkpoints where it holds.
     let banded: Vec<(f64, (f64, f64))> = pts
         .iter()
-        .filter_map(|c| band(o, c.n).map(|b| (c.n as f64, b)))
+        .filter_map(|c| band_with(o, sd, c.n).map(|b| (c.n as f64, b)))
         .collect();
     if banded.len() > 1 {
         let upper: Vec<String> = banded

@@ -497,3 +497,13 @@ fn round_two_edge_cases() {
         .unwrap();
     assert!(suggested < 1000, "{err}");
 }
+
+#[test]
+fn a_sweep_is_costed_as_a_whole() {
+    let (code, _, err) = probsim(&[
+        "sweep", "secretary", "--vary", "skip", "--from", "0", "--to", "99999", "--steps", "200", "--candidates",
+        "100000", "--trials", "200000",
+    ]);
+    assert_eq!(code, 2);
+    assert!(err.contains("this sweep would take about") && err.contains("per point"), "{err}");
+}
