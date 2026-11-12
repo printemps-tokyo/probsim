@@ -6,7 +6,8 @@ use probsim::benford::{
 };
 use probsim::exact;
 use probsim::paradox::{
-    birthday_probability, coins, secretary_best_skip, secretary_success, Chord, Paradox, Weights,
+    birthday_probability, coins, gambler_duration, gambler_success, secretary_best_skip,
+    secretary_success, st_petersburg_k, Chord, Paradox, Weights,
 };
 use probsim::rng::Rng;
 use probsim::stats::{binomial_central, chi_square_p, harmonic, ln_gamma, wilson, Running, Z95};
@@ -568,4 +569,117 @@ fn degenerate_binomials() {
     assert_eq!(binomial_central(20, 0.0, 0.95), (0, 0));
     assert_eq!(binomial_central(20, 1.0, 0.95), (20, 20));
     assert_eq!(binomial_central(0, 0.5, 0.95), (0, 0));
+}
+
+#[test]
+fn st_petersburg_by_summing_every_length() {
+    for bank in [2u64, 3, 64, 100, 1_000_000, 1 << 40] {
+        let k = st_petersburg_k(bank);
+        assert!(1u64 << k <= bank && (1u128 << (k + 1)) > u128::from(bank));
+        // Sum over lengths 1..200 of 2^-n min(2^n, bank), and the squares.
+        let (mut mean, mut second) = (0.0f64, 0.0f64);
+        for n in 1..200i32 {
+            let prize = if n >= 63 {
+                bank as f64
+            } else {
+                (1u64 << n).min(bank) as f64
+            };
+            let chance = 2f64.powi(-n);
+            mean += chance * prize;
+            second += chance * prize * prize;
+        }
+        let p = Paradox::StPetersburg { bank };
+        assert!(close(p.theory(), mean, 1e-9 * mean), "{bank}");
+        let var = second - mean * mean;
+        assert!(close(p.theory_variance(), var, 1e-9 * var), "{bank}");
+    }
+    assert!(close(
+        Paradox::StPetersburg { bank: 1_000_000 }.theory(),
+        19.0 + 1e6 / 524_288.0,
+        1e-12
+    ));
+    assert_eq!(
+        Paradox::StPetersburg { bank: 64 }.min_for_interval(),
+        30 * 64
+    );
+}
+
+#[test]
+fn simpson_reverses_on_the_kidney_stone_table() {
+    let counts = [(81, 87), (192, 263), (234, 270), (55, 80)];
+    let crude = Paradox::Simpson {
+        counts,
+        adjusted: false,
+    };
+    let adjusted = Paradox::Simpson {
+        counts,
+        adjusted: true,
+    };
+    assert!(close(crude.theory(), 273.0 / 350.0 - 289.0 / 350.0, 1e-12));
+    let want =
+        (357.0 * (81.0 / 87.0 - 234.0 / 270.0) + 343.0 * (192.0 / 263.0 - 55.0 / 80.0)) / 700.0;
+    assert!(close(adjusted.theory(), want, 1e-12));
+    assert!(crude.theory() < 0.0 && adjusted.theory() > 0.0);
+    // Variance from the distribution of A - B over {-1, 0, 1}.
+    let (a, b) = (273.0 / 350.0, 289.0 / 350.0);
+    let (up, down) = (a * (1.0 - b), b * (1.0 - a));
+    let var = up + down - (up - down) * (up - down);
+    assert!(close(crude.theory_variance(), var, 1e-12));
+}
+
+/// Gambler's ruin by iterating the first-step equations
+/// P(i) = p P(i+1) + q P(i-1) and D(i) = 1 + p D(i+1) + q D(i-1) to a fixed point.
+fn ruin_by_iteration(goal: usize, p: f64) -> (Vec<f64>, Vec<f64>) {
+    let (mut prob, mut dur) = (vec![0.0; goal + 1], vec![0.0; goal + 1]);
+    prob[goal] = 1.0;
+    for _ in 0..200_000 {
+        for i in 1..goal {
+            prob[i] = p * prob[i + 1] + (1.0 - p) * prob[i - 1];
+            dur[i] = 1.0 + p * dur[i + 1] + (1.0 - p) * dur[i - 1];
+        }
+    }
+    (prob, dur)
+}
+
+#[test]
+fn gambler_formulas_match_the_first_step_equations() {
+    for (goal, p) in [(10usize, 0.5), (20, 18.0 / 37.0), (8, 0.7), (12, 0.3)] {
+        let (prob, dur) = ruin_by_iteration(goal, p);
+        for start in 1..goal {
+            let s = gambler_success(start as u32, goal as u32, p);
+            assert!(
+                close(s, prob[start], 1e-9),
+                "{goal} {p} {start}: {s} vs {}",
+                prob[start]
+            );
+            let d = gambler_duration(start as u32, goal as u32, p);
+            assert!(
+                close(d, dur[start], 1e-6 * dur[start].max(1.0)),
+                "{goal} {p} {start}: {d} vs {}",
+                dur[start]
+            );
+        }
+    }
+    assert!(close(gambler_success(3, 10, 0.5), 0.3, 1e-15));
+    // Long games stay finite and ordered.
+    // About e^-2000: below the smallest double, so exactly 0, never NaN.
+    assert_eq!(gambler_success(50_000, 100_000, 0.49), 0.0);
+    // r = 51/49, i = 500, N = 1000: about r^-500 (1 - r^-500) / (1 - r^-1000).
+    let r: f64 = 51.0 / 49.0;
+    let want = r.powi(-500) * (1.0 - r.powi(-500)) / (1.0 - r.powi(-1000));
+    let got = gambler_success(500, 1_000, 0.49);
+    assert!(close(got, want, 1e-12 * want), "{got} vs {want}");
+    let near_fair = gambler_success(50_000, 100_000, 0.5 - 1e-9);
+    assert!(close(near_fair, 0.5, 1e-3), "{near_fair}");
+    assert!(close(gambler_success(99_999, 100_000, 0.9), 1.0, 1e-12));
+}
+
+#[test]
+fn gambler_duration_near_a_fair_game_does_not_cancel() {
+    // (i - N P) / (q - p) cancels to 0 here; the fair value is used instead.
+    let d = gambler_duration(99_999, 100_000, 0.499_999_999_999_999_94);
+    assert!(close(d, 99_999.0, 1.0), "{d}");
+    let fair = gambler_duration(500, 1_000, 0.5);
+    let near = gambler_duration(500, 1_000, 0.5 - 1e-9);
+    assert!(close(near, fair, 1e-3 * fair), "{near} vs {fair}");
 }

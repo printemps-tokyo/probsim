@@ -135,6 +135,8 @@ pub fn compact(n: u64) -> String {
 fn value(m: Measure, x: f64) -> String {
     match m {
         Measure::Probability => format!("{x:.5}"),
+        // A small average (Simpson's difference) needs more decimals.
+        Measure::Mean if x.abs() < 1.0 => format!("{x:.4}"),
         Measure::Mean => format!("{x:.2}"),
     }
 }
@@ -150,6 +152,20 @@ pub fn chart(
     width: usize,
     height: usize,
     sd: Option<f64>,
+) -> Vec<String> {
+    chart_from(points, theory, m, width, height, sd, MIN_FOR_MEAN)
+}
+
+/// `chart` with the band for an average drawn only from `min_n` trials (see
+/// `Paradox::min_for_interval`).
+pub fn chart_from(
+    points: &[Checkpoint],
+    theory: f64,
+    m: Measure,
+    width: usize,
+    height: usize,
+    sd: Option<f64>,
+    min_n: u64,
 ) -> Vec<String> {
     let (width, height) = (width.max(10), height.max(5));
     if points.is_empty() {
@@ -207,7 +223,7 @@ pub fn chart(
             // an average).
             let holds = match m {
                 Measure::Probability => n * theory >= 5.0 && n * (1.0 - theory) >= 5.0,
-                Measure::Mean => n >= MIN_FOR_MEAN as f64,
+                Measure::Mean => n >= min_n as f64,
             };
             if !holds {
                 continue;
@@ -405,12 +421,23 @@ pub fn report(o: &Outcome, opt: &TextOptions) -> String {
     };
     let _ = writeln!(s, "{}", field(l.simulated, &sim));
     let pad = " ".repeat(text_width(l.simulated) + 2);
+    let min_n = o.paradox.min_for_interval();
     let verdict = match o.consistent(Z95) {
-        Some(true) => l.inside,
-        Some(false) => l.outside,
-        None => l.too_few,
+        Some(true) => l.inside.to_string(),
+        Some(false) => l.outside.to_string(),
+        None if m == Measure::Mean && min_n > MIN_FOR_MEAN => match opt.lang {
+            Lang::En => format!(
+                "too few trials for an interval: this average needs at least {} (see Why)",
+                grouped(min_n)
+            ),
+            Lang::Ja => format!(
+                "信頼区間を出すには試行が少なすぎます(この平均には{}回以上必要。理由を参照)",
+                grouped(min_n)
+            ),
+        },
+        None => l.too_few.to_string(),
     };
-    let _ = writeln!(s, "{pad}{}", wrap(verdict, WRAP - pad.len(), pad.len()));
+    let _ = writeln!(s, "{pad}{}", wrap(&verdict, WRAP - pad.len(), pad.len()));
     if o.counted < o.attempted {
         let skipped = o.attempted - o.counted;
         let note = match (opt.lang, &o.paradox) {
@@ -471,7 +498,15 @@ pub fn report(o: &Outcome, opt: &TextOptions) -> String {
         };
         let _ = writeln!(s, "\n{title}");
         let sd = o.variance().sqrt();
-        for line in chart(&o.checkpoints, o.theory, m, opt.width, 11, Some(sd)) {
+        for line in chart_from(
+            &o.checkpoints,
+            o.theory,
+            m,
+            opt.width,
+            11,
+            Some(sd),
+            o.paradox.min_for_interval(),
+        ) {
             let _ = writeln!(s, "  {line}");
         }
         let _ = writeln!(s, "  {}", l.legend);
@@ -761,9 +796,44 @@ fn coupon_quantiles(o: &Outcome, lang: Lang) -> Option<String> {
     })
 }
 
-/// The quantile line for a coupon report, wrapped, if there is one.
+/// Quantiles of the St. Petersburg prizes: most games pay little, and the
+/// mean comes from the rare large ones.
+fn st_petersburg_quantiles(o: &Outcome, lang: Lang) -> Option<String> {
+    let Paradox::StPetersburg { .. } = &o.paradox else {
+        return None;
+    };
+    let d = o.distribution.as_ref()?;
+    let q: Vec<u64> = [0.5, 0.9, 0.99]
+        .iter()
+        .map(|&q| crate::sim::quantile(d, q))
+        .collect::<Option<_>>()?;
+    let max = *d.keys().next_back()?;
+    Some(match lang {
+        Lang::En => format!(
+            "Half of the games paid {} or less, 90% paid {} or less, 99% paid {} or less; the largest \
+             prize was {}. The average is made by the rare large prizes.",
+            grouped(q[0]),
+            grouped(q[1]),
+            grouped(q[2]),
+            grouped(max)
+        ),
+        Lang::Ja => format!(
+            "半数のゲームの賞金は{}以下、90%は{}以下、99%は{}以下で、最高は{}でした。平均を作るのは、\
+             まれな高額賞金です。",
+            grouped(q[0]),
+            grouped(q[1]),
+            grouped(q[2]),
+            grouped(max)
+        ),
+    })
+}
+
+/// The quantile line for a coupon or St. Petersburg report, wrapped, if
+/// there is one.
 pub fn quantile_note(o: &Outcome, lang: Lang) -> Option<String> {
-    coupon_quantiles(o, lang).map(|q| wrap(&q, WRAP - 13, 13))
+    coupon_quantiles(o, lang)
+        .or_else(|| st_petersburg_quantiles(o, lang))
+        .map(|q| wrap(&q, WRAP - 13, 13))
 }
 
 /// A sweep: one row per parameter value, then a chart of exact and simulated.

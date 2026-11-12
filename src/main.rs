@@ -39,6 +39,11 @@ Paradoxes:
   penney       Penney's coin game             --first HHT, --second SEQ (best reply)
   boy-girl     Two children, one a boy...     --any-day (drop the Tuesday)
   bertrand     A random chord                 --method endpoints|radius|midpoint
+  st-petersburg  Flip until heads, win 2^k    --bank W (1,000,000): the most it pays
+  simpson      Better in each group, worse    --counts A1,A2,B1,B2 as cured/patients
+               overall                        (kidney stones), --adjusted
+  gambler      Gambler's ruin                 --start I (10), --goal N (20),
+                                              --win-prob P (18/37, roulette red)
   benford      Leading digits                 --source powers2|fibonacci,
                                               --file PATH (- for stdin), --column N,
                                               --delimiter C, --digits 1|2
@@ -80,7 +85,18 @@ const SIMS: &[&str] = &[
     "penney",
     "boy-girl",
     "bertrand",
+    "st-petersburg",
+    "simpson",
+    "gambler",
 ];
+
+/// The kidney stone study (Charig et al. 1986, as tabulated by Julious and
+/// Mullee 1994): open surgery on small and large stones, then
+/// percutaneous nephrolithotomy on small and large stones.
+const KIDNEY: [(u32, u32); 4] = [(81, 87), (192, 263), (234, 270), (55, 80)];
+
+/// The largest St. Petersburg bank: prizes stay exact in f64 below 2^53.
+const MAX_BANK: u64 = 1 << 53;
 
 #[derive(Clone)]
 struct Args {
@@ -121,6 +137,12 @@ struct Args {
     second: Option<String>,
     any_day: bool,
     method: Chord,
+    bank: u64,
+    counts: [(u32, u32); 4],
+    adjusted: bool,
+    start: u32,
+    goal: u32,
+    win_prob: f64,
     source: Option<String>,
     file: Option<String>,
     column: Option<usize>,
@@ -178,6 +200,7 @@ const SWITCHES: &[&str] = &[
     "--no-chart",
     "--random-host",
     "--any-day",
+    "--adjusted",
     "--help",
     "--version",
 ];
@@ -219,6 +242,12 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
         second: None,
         any_day: false,
         method: Chord::Endpoints,
+        bank: 1_000_000,
+        counts: KIDNEY,
+        adjusted: false,
+        start: 10,
+        goal: 20,
+        win_prob: 18.0 / 37.0,
         source: None,
         file: None,
         column: None,
@@ -297,6 +326,16 @@ fn parse(argv: Vec<String>) -> Result<Option<Args>, String> {
                     _ => return Err("--method must be endpoints, radius or midpoint".into()),
                 }
             }
+            "--bank" => a.bank = in_range(&flag, number(&flag, val())?, 2, MAX_BANK)?,
+            "--counts" => {
+                a.counts = simpson_counts(&val().ok_or(
+                    "--counts needs four cured/patients pairs, like 81/87,192/263,234/270,55/80",
+                )?)?
+            }
+            "--adjusted" => a.adjusted = true,
+            "--start" => a.start = in_range(&flag, number(&flag, val())?, 1, 99_999)?,
+            "--goal" => a.goal = in_range(&flag, number(&flag, val())?, 2, 100_000)?,
+            "--win-prob" => a.win_prob = fraction(&flag, val())?,
             "--source" => a.source = Some(val().ok_or("--source needs a value")?),
             "--file" => {
                 a.file = Some(val().ok_or("--file needs a file name, or - for standard input")?)
@@ -362,6 +401,9 @@ fn applies(a: &Args, flag: &str) -> bool {
         "--first" | "--second" => p == "penney",
         "--any-day" => p == "boy-girl",
         "--method" => p == "bertrand",
+        "--bank" => p == "st-petersburg",
+        "--counts" | "--adjusted" => p == "simpson",
+        "--start" | "--goal" | "--win-prob" => p == "gambler",
         "--source" | "--file" | "--digits" => c == "benford",
         "--column" | "--delimiter" => c == "benford" && a.file.is_some(),
         // A file has as many numbers as it has; --trials sets a sequence's length.
@@ -388,6 +430,38 @@ fn numbers_from(text: &str) -> Result<Vec<f64>, String> {
                 .map_err(|_| format!("{f:?} is not a number"))
         })
         .collect()
+}
+
+/// Four "cured/patients" pairs: A in group 1 and 2, then B in group 1 and 2.
+fn simpson_counts(text: &str) -> Result<[(u32, u32); 4], String> {
+    let pairs: Vec<&str> = text.split(',').map(str::trim).collect();
+    if pairs.len() != 4 {
+        return Err(
+            "--counts needs four cured/patients pairs: A group 1, A group 2, B group 1, B group 2"
+                .into(),
+        );
+    }
+    let mut out = [(0u32, 0u32); 4];
+    for (slot, pair) in out.iter_mut().zip(&pairs) {
+        let (s, n) = pair
+            .split_once('/')
+            .ok_or_else(|| format!("--counts: {pair:?} is not cured/patients"))?;
+        let s: u32 = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("--counts: {pair:?} is not cured/patients"))?;
+        let n: u32 = n
+            .trim()
+            .parse()
+            .map_err(|_| format!("--counts: {pair:?} is not cured/patients"))?;
+        if n == 0 || s > n || n > 1_000_000_000 {
+            return Err(format!(
+                "--counts: {pair:?} needs 1 to 1,000,000,000 patients and no more cured than patients"
+            ));
+        }
+        *slot = (s, n);
+    }
+    Ok(out)
 }
 
 fn read_file(path: &str) -> Result<String, String> {
@@ -569,6 +643,24 @@ fn paradox(a: &Args, name: &str) -> Result<Paradox, String> {
             tuesday: !a.any_day,
         },
         "bertrand" => Paradox::Bertrand { method: a.method },
+        "st-petersburg" => Paradox::StPetersburg { bank: a.bank },
+        "simpson" => Paradox::Simpson {
+            counts: a.counts,
+            adjusted: a.adjusted,
+        },
+        "gambler" => {
+            if a.start >= a.goal {
+                return Err(format!("--start must be less than --goal ({})", a.goal));
+            }
+            if a.win_prob <= 0.0 || a.win_prob >= 1.0 {
+                return Err("--win-prob must be above 0 and below 1".into());
+            }
+            Paradox::Gambler {
+                start: a.start,
+                goal: a.goal,
+                win: a.win_prob,
+            }
+        }
         other => return Err(format!("unknown paradox {other:?}; see probsim list")),
     })
 }
@@ -602,6 +694,10 @@ fn set_param(a: &mut Args, name: &str, v: f64) -> Result<(), String> {
         "prevalence" => a.prevalence = prob()?,
         "sensitivity" => a.sensitivity = prob()?,
         "specificity" => a.specificity = prob()?,
+        "bank" => a.bank = whole(2.0, MAX_BANK as f64)?,
+        "start" => a.start = whole(1.0, 99_999.0)? as u32,
+        "goal" => a.goal = whole(2.0, 100_000.0)? as u32,
+        "win-prob" => a.win_prob = prob()?,
         _ => {
             return Err(format!(
                 "--vary {name}: not a number parameter of this paradox"
@@ -614,7 +710,16 @@ fn set_param(a: &mut Args, name: &str, v: f64) -> Result<(), String> {
 fn integer_param(name: &str) -> bool {
     matches!(
         name,
-        "doors" | "people" | "days" | "items" | "budget" | "candidates" | "skip"
+        "doors"
+            | "people"
+            | "days"
+            | "items"
+            | "budget"
+            | "candidates"
+            | "skip"
+            | "bank"
+            | "start"
+            | "goal"
     )
 }
 
@@ -627,6 +732,8 @@ fn sweepable(p: &str) -> &'static [&'static str] {
         "secretary" => &["candidates", "skip"],
         "buffon" => &["length", "spacing"],
         "base-rate" => &["prevalence", "sensitivity", "specificity"],
+        "st-petersburg" => &["bank"],
+        "gambler" => &["start", "goal", "win-prob"],
         _ => &[],
     }
 }
@@ -692,6 +799,18 @@ const LIST: &[(&str, &str)] = &[
         "Bertrand's paradox: three ways to draw a random chord, three answers",
     ),
     (
+        "st-petersburg",
+        "An infinite expected prize, yet a fair price of about 21: the St. Petersburg game",
+    ),
+    (
+        "simpson",
+        "Better in every group, worse overall: Simpson's paradox (kidney stones)",
+    ),
+    (
+        "gambler",
+        "Gambler's ruin: a slightly unfair game and how often you double your money",
+    ),
+    (
         "benford",
         "Why 1 leads 30% of the time: Benford's law, also on your own data",
     ),
@@ -699,7 +818,11 @@ const LIST: &[(&str, &str)] = &[
 
 /// Too few trials to judge, under --check.
 fn undecided(what: &str) -> String {
-    format!("--check cannot judge {what}: too few trials (an average needs at least 30; benford needs enough numbers)")
+    let need = match what {
+        "st-petersburg" => " (st-petersburg needs 30 x 2^K, K = floor(log2 of --bank))",
+        _ => "",
+    };
+    format!("--check cannot judge {what}: too few trials (an average needs at least 30{need}; benford needs enough numbers)")
 }
 
 /// Roughly how many basic steps (draws, flips, shuffled candidates) a run
@@ -724,6 +847,11 @@ fn work(p: &Paradox, trials: u64) -> f64 {
         Paradox::Secretary { candidates, .. } => *candidates as f64,
         // The waiting time for a sequence of n flips is at most 2^(n+1).
         Paradox::Penney { first, .. } => 2f64.powi(first.len() as i32 + 1),
+        // Two flips on average.
+        Paradox::StPetersburg { .. } => 2.0,
+        Paradox::Gambler { start, goal, win } => {
+            probsim::paradox::gambler_duration(*start, *goal, *win).max(1.0)
+        }
         _ => 1.0,
     };
     per_trial * trials as f64 + probsim::paradox::theory_cost(p)
@@ -1005,6 +1133,9 @@ fn run(mut a: Args) -> Result<ExitCode, String> {
             for o in &outcomes {
                 match o.consistent(Z999) {
                     Some(c) => ok &= c,
+                    // The St. Petersburg game needs far more trials than the
+                    // others for an interval; `all` judges it only then.
+                    None if o.paradox.min_for_interval() > trials => {}
                     None => return Err(undecided(o.paradox.name())),
                 }
             }

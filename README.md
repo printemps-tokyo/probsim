@@ -1,6 +1,6 @@
 # probsim
 
-> Watch probability paradoxes converge, next to their exact answers: Monty Hall, the birthday paradox, gacha completion, the secretary problem, Buffon's needle, the base rate fallacy, Penney's game, the boy or girl paradox, Bertrand's paradox and Benford's law (also on your own data). Zero-dependency Rust CLI.
+> Watch probability paradoxes converge, next to their exact answers: Monty Hall, the birthday paradox, gacha completion, the secretary problem, Buffon's needle, the base rate fallacy, Penney's game, the boy or girl paradox, Bertrand's paradox, the St. Petersburg paradox, Simpson's paradox, gambler's ruin and Benford's law (also on your own data). Zero-dependency Rust CLI.
 
 [![CI](https://github.com/printemps-tokyo/probsim/actions/workflows/ci.yml/badge.svg)](https://github.com/printemps-tokyo/probsim/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
@@ -80,6 +80,9 @@ probsim base-rate --prevalence 1%             # a positive test for a rare disea
 probsim penney --first HTH                    # Penney's game; the second picks the best reply
 probsim boy-girl                              # the Tuesday boy
 probsim bertrand --method midpoint            # one of three random chords
+probsim st-petersburg --bank 1000000          # an infinite expectation, cut off by a bank
+probsim simpson --adjusted                    # better in each group, worse overall
+probsim gambler --start 10 --goal 20          # double your money at roulette?
 probsim benford --file sales.csv --column 3   # your own numbers
 probsim sweep birthday --vary people --from 1 --to 60
 probsim coverage monty-hall --runs 200
@@ -99,6 +102,9 @@ base-rate        0.16667     0.17405  [0.16467, 0.18385]      ok
 penney           0.75000     0.75050  [0.74781, 0.75317]      ok
 boy-girl         0.48148     0.47807  [0.46968, 0.48647]      ok
 bertrand         0.33333     0.33521  [0.33229, 0.33814]      ok
+st-petersburg       20.91       30.46  -                       too few
+simpson          -0.0457     -0.0478  [-0.0513, -0.0443]      ok
+gambler          0.36803     0.36876  [0.36577, 0.37176]      ok
 benford                -     p=1.000  powers2 100,000         ok
 
 100,000 trials each, seed 7 (each paradox gets its own stream from it; see --json)
@@ -133,11 +139,23 @@ error or when `--check` cannot judge.
 | `penney` | Two players pick coin sequences; the one whose sequence appears first wins. From three flips on, whatever the first picks, the second can pick one that wins more often: against HHT, THH wins 3/4. | `--first SEQ` (HHT), `--second SEQ` (the best reply, found by checking every sequence) |
 | `boy-girl` | Two children, at least one a boy born on a Tuesday: both boys with probability 13/27; without the Tuesday, 1/3. | `--any-day` |
 | `bertrand` | A random chord is longer than the inscribed triangle's side with probability 1/3, 1/2 or 1/4, depending on how it is drawn. | `--method endpoints\|radius\|midpoint` |
+| `st-petersburg` | Flip until heads; k flips pay 2^k, but never more than the bank W. The expected prize is K + W/2^K with K = floor(log2 W): 20.91 for a bank of a million, although without a bank it is infinite. Its largest prizes are so rare that an interval is given only from 30 x 2^K games (15.7 million for the default bank); below that, the average is shown without one, and that drift is the paradox. | `--bank W` (1,000,000), 2 to 2^53 |
+| `simpson` | A treatment better in each group can look worse overall when it got more of the hard cases. One trial treats one patient with A and one with B and scores 1, 0 or -1; the crude comparison draws each from their own arm (-0.046 on the kidney stone data, B looks better), `--adjusted` draws both from the same group (+0.054, A is better). | `--counts A1,A2,B1,B2` as cured/patients (81/87,192/263,234/270,55/80), `--adjusted` |
+| `gambler` | Bet 1 at a time from `start` until `goal` or ruin. A fair game reaches the goal with probability start/goal; at European roulette red (18/37), doubling 10 into 20 succeeds only 36.8% of the time. | `--start I` (10), `--goal N` (20), `--win-prob P` (18/37) |
 | `benford` | In data that follows Benford's law, digit d leads with probability log10(1 + 1/d): 30.1% for 1. | `--source powers2\|fibonacci`, `--file PATH` (`-` for standard input), `--column N`, `--delimiter C`, `--digits 1\|2` |
 
 The conditional questions (the careless host, a positive test, a family with
 such a boy) count only the trials that match the condition, and say how many
 were left out.
+
+The default Simpson table is the kidney stone study of Charig et al. (BMJ
+1986), as tabulated by Julious and Mullee (BMJ 1994): group 1 small stones,
+group 2 large; A open surgery, B percutaneous nephrolithotomy. The figures were
+checked against the table in the English Wikipedia article on Simpson's
+paradox, not against the scanned original. Gambler's ruin uses the classical
+formula (1 - r^i) / (1 - r^N) with r = q/p, evaluated with `expm1` so that long
+games and near-fair odds stay accurate; the tests check it, and the expected
+number of bets, against the first-step equations solved by iteration.
 
 ### Gacha: unequal rates and the long tail
 
@@ -312,15 +330,19 @@ large.
   The tests check them against published values or brute-force counts.
 - Intervals: Wilson score intervals for probabilities (with no successes the
   lower bound is exactly 0, with all successes the upper bound exactly 1), and
-  mean +- z x standard error for averages, given only from 30 trials up.
+  mean +- z x standard error for averages, given only from 30 trials up (for
+  the St. Petersburg game, from 30 x 2^K: in a separate simulation with a
+  bank of 4,096, the 99.9% interval missed the exact mean in 0.8% of 4,000
+  runs at 3 x 2^K games and in 0.13% at 30 x 2^K).
   The dots on the chart are exact +- 1.96 x sd / sqrt(n), from the exact
   standard deviation of one trial: by the normal approximation, about 95% of
   runs are inside at each point. They are drawn only where that holds (n p
   and n (1 - p) at least 5 for a probability, 30 trials for an average), and
   not for gacha with unequal rates, where the exact variance is not computed.
 - `--check` uses 99.9% intervals, so with enough trials a correct simulation
-  fails one check about once in 1,000 runs; `probsim all` makes ten checks
-  (about 1%). In `all` each paradox gets its own random stream derived from
+  fails one check about once in 1,000 runs; `probsim all` makes twelve checks
+  (about 1%), plus St. Petersburg when `--trials` reaches its minimum (it is
+  left out of the verdict below that). In `all` each paradox gets its own random stream derived from
   the seed; `--json` lists every one. `sweep` and `coverage` have no `--check`.
 - Benford: powers of two and Fibonacci numbers are exact while they fit in
   128 bits (2^127, F_186) and are computed from logarithms after that; a

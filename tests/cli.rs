@@ -52,7 +52,7 @@ fn help_version_and_list() {
         probsim(&["-V"]).1,
         format!("probsim {}\n", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(probsim(&["list"]).1.lines().count(), 10);
+    assert_eq!(probsim(&["list"]).1.lines().count(), 13);
 }
 
 #[test]
@@ -76,6 +76,16 @@ fn usage_errors_exit_2() {
         &["penney", "--first", "HHT", "--second", "HHT"][..],
         &["penney", "--first", "HXT"][..],
         &["bertrand", "--method", "diameter"][..],
+        &["st-petersburg", "--bank", "1"][..],
+        &["st-petersburg", "--bank", "9007199254740993"][..],
+        &["simpson", "--counts", "1/2,3/4"][..],
+        &["simpson", "--counts", "5/4,1/1,1/1,1/1"][..],
+        &["simpson", "--counts", "1/0,1/1,1/1,1/1"][..],
+        &["simpson", "--bank", "10"][..],
+        &["gambler", "--start", "20", "--goal", "20"][..],
+        &["gambler", "--win-prob", "0"][..],
+        &["gambler", "--win-prob", "100%"][..],
+        &["gambler", "--adjusted"][..],
         &["coupon", "--weights", "1,0,1"][..],
         &["coupon", "--weights", "1,1", "--items", "3"][..],
         &["coupon", "--weights", "1,2", "--weights-file", "x"][..],
@@ -121,6 +131,28 @@ fn new_paradoxes_run() {
         &["bertrand", "--method", "radius", "--trials", "20000"][..],
         &["coupon", "--weights", "1,1,1,0.2", "--trials", "20000"][..],
         &["gacha", "--budget", "40", "--trials", "20000"][..],
+        &["st-petersburg", "--bank", "64", "--trials", "20000"][..],
+        &["simpson", "--trials", "20000"][..],
+        &["simpson", "--adjusted", "--trials", "20000"][..],
+        &[
+            "simpson",
+            "--counts",
+            "8/10,1/10,90/100,0/1",
+            "--trials",
+            "20000",
+        ][..],
+        &["gambler", "--trials", "20000"][..],
+        &[
+            "gambler",
+            "--start",
+            "2",
+            "--goal",
+            "5",
+            "--win-prob",
+            "50%",
+            "--trials",
+            "20000",
+        ][..],
     ] {
         let mut a = args.to_vec();
         a.extend(["--seed", "3", "--check", "--no-chart"]);
@@ -534,4 +566,103 @@ fn the_exact_answer_counts_toward_the_cost() {
         err.contains("the exact answers alone") && err.contains("--steps"),
         "{err}"
     );
+}
+
+#[test]
+fn st_petersburg_waits_for_enough_games() {
+    // The default bank needs 30 x 2^19 games for an interval.
+    let (code, out, err) = probsim(&["st-petersburg", "--seed", "1", "--no-chart", "--lang", "en"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("this average needs at least") && out.contains("15,728,640"),
+        "{out}"
+    );
+    let (code, _, err) = probsim(&["st-petersburg", "--seed", "1", "--check"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("30 x 2^K"), "{err}");
+    // `all --check` judges the rest and leaves it out.
+    let (code, _, err) = probsim(&["all", "--check", "--seed", "5", "--trials", "20000"]);
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn simpson_and_gambler_explain_and_sweep() {
+    let (code, out, _) = probsim(&[
+        "simpson",
+        "--adjusted",
+        "--explain",
+        "2",
+        "--seed",
+        "2",
+        "--no-chart",
+        "--lang",
+        "en",
+    ]);
+    assert_eq!(code, 0);
+    assert!(out.contains("Pair 1: A's patient (group"), "{out}");
+    let (code, out, _) = probsim(&[
+        "gambler",
+        "--explain",
+        "1",
+        "--seed",
+        "2",
+        "--no-chart",
+        "--lang",
+        "ja",
+    ]);
+    assert_eq!(code, 0);
+    assert!(out.contains("回賭けて"), "{out}");
+    let (code, out, err) = probsim(&[
+        "sweep", "gambler", "--vary", "goal", "--from", "12", "--to", "30", "--steps", "4",
+        "--trials", "2000", "--seed", "1", "--json",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("\"goal\""), "{out}");
+    let (code, _, err) = probsim(&[
+        "sweep", "simpson", "--vary", "counts", "--from", "1", "--to", "2",
+    ]);
+    assert_eq!(code, 2, "{err}");
+}
+
+#[test]
+fn texts_follow_the_numbers_given() {
+    // Groups swapped: group 1 is now the hard one.
+    let (code, out, _) = probsim(&[
+        "simpson",
+        "--counts",
+        "192/263,81/87,55/80,234/270",
+        "--seed",
+        "1",
+        "--no-chart",
+        "--lang",
+        "en",
+    ]);
+    assert_eq!(code, 0);
+    assert!(out.contains("group 1, where recovery is rarer"), "{out}");
+    assert!(!out.contains("Charig"), "{out}");
+    let (_, out, _) = probsim(&[
+        "gambler",
+        "--win-prob",
+        "0.6",
+        "--seed",
+        "1",
+        "--no-chart",
+        "--lang",
+        "en",
+    ]);
+    assert!(out.contains("the edge on your side"), "{out}");
+    let (_, out, _) = probsim(&["st-petersburg", "--seed", "1", "--no-chart", "--lang", "en"]);
+    assert!(out.contains("Half of the games paid"), "{out}");
+    let (code, _, err) = probsim(&[
+        "gambler",
+        "--start",
+        "99999",
+        "--goal",
+        "100000",
+        "--win-prob",
+        "0.49999999999999994",
+        "--trials",
+        "100000000",
+    ]);
+    assert_eq!(code, 2, "{err}");
 }

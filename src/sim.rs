@@ -37,7 +37,7 @@ pub struct Outcome {
 
 impl Outcome {
     /// The interval at confidence z: Wilson for a probability, normal for an
-    /// average (None below `stats::MIN_FOR_MEAN` trials).
+    /// average (None below the paradox's `min_for_interval` trials).
     pub fn interval(&self, z: f64) -> Option<(f64, f64)> {
         if self.counted == 0 {
             // Nothing to estimate from (no trial matched the condition).
@@ -45,6 +45,7 @@ impl Outcome {
         }
         match self.paradox.measure() {
             Measure::Probability => Some(wilson(self.successes, self.counted, z)),
+            Measure::Mean if self.counted < self.paradox.min_for_interval() => None,
             Measure::Mean => normal_interval(&self.running, z),
         }
     }
@@ -120,8 +121,9 @@ pub fn simulate_known(p: &Paradox, theory: f64, trials: u64, seed: u64, points: 
     let mut rng = Rng::new(seed);
     let mut running = Running::default();
     let mut successes = 0u64;
-    let mut distribution =
-        (p.measure() == Measure::Mean).then(std::collections::BTreeMap::<u64, u64>::new);
+    let mut distribution = p
+        .whole_trials()
+        .then(std::collections::BTreeMap::<u64, u64>::new);
     let probability = p.measure() == Measure::Probability;
     let estimate = |running: &Running, successes: u64| {
         if probability && running.n > 0 {

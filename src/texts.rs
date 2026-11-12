@@ -1,7 +1,7 @@
 //! The words around each paradox, in English and Japanese.
 
 use crate::exact;
-use crate::paradox::{coins_text, Chord, Lang, Paradox};
+use crate::paradox::{coins_text, st_petersburg_k, Chord, Lang, Paradox};
 
 /// The words around a result.
 pub struct Texts {
@@ -643,5 +643,304 @@ pub fn texts(paradox: &Paradox, lang: Lang) -> Texts {
             "本目",
             "弦が長い確率",
         ),
+        (Paradox::StPetersburg { bank }, lang) => {
+            let k = st_petersburg_k(*bank);
+            let bank_text = crate::output::grouped(*bank);
+            let fair = format!("{p:.2}");
+            match lang {
+                Lang::En => t(
+                    format!("St. Petersburg paradox (a bank of {bank_text})"),
+                    format!(
+                        "A coin is flipped until it lands heads. If that takes k flips, you win 2^k: 2 for \
+                         heads at once, 4 for one tail first, 8 for two, and so on, but never more than the \
+                         bank of {bank_text}. What is a fair price to play?"
+                    ),
+                    "Without the bank the expected prize is infinite, so any price would be a bargain.".into(),
+                    format!(
+                        "With a bank of {bank_text}, a fair price is {fair} ({}).",
+                        paradox.exact().unwrap_or_default()
+                    ),
+                    format!(
+                        "Each extra tail doubles the prize and halves its chance, so every possible length adds \
+                         1 to the expected prize: {k} lengths the bank pays in full, plus the bank itself times \
+                         the chance 2^-{k} of a longer game. Without a bank the sum never ends. Yet most games \
+                         pay 2 or 4, and the prizes that make the mean are so rare that a run of games usually \
+                         misses them and averages less; only over very many games does the average settle, so \
+                         the interval is drawn from 30 x 2^{k} games."
+                    ),
+                    "games",
+                    "Game",
+                    "the prize",
+                ),
+                Lang::Ja => t(
+                    format!("サンクトペテルブルクのパラドックス(胴元の資金{bank_text})"),
+                    format!(
+                        "表が出るまでコインを投げ、k回目で表が出たら2^kもらえます。すぐ表なら2、裏1回の後なら4、\
+                         2回なら8……ただし胴元の資金{bank_text}を超えては払われません。参加費はいくらが公平?"
+                    ),
+                    "資金の上限がなければ期待値は無限大なので、いくら払っても得なはず。".into(),
+                    format!(
+                        "資金が{bank_text}なら公平な参加費は{fair}({})。",
+                        paradox.exact().unwrap_or_default()
+                    ),
+                    format!(
+                        "裏が1回増えるごとに賞金は2倍、確率は半分なので、どの長さも期待値に1ずつ足します。胴元が満額\
+                         払える長さは{k}通りで、それより長いゲームは確率2^-{k}で資金全額です。上限がなければ和は\
+                         終わりません。それでもたいていのゲームの賞金は2か4で、平均を押し上げる高額賞金はめったに\
+                         出ないため、遊んだ回数が少ないうちは平均が期待値より低く出がちです。平均が落ち着くのは\
+                         非常に多く遊んだときだけなので、信頼区間は30 x 2^{k}回から出します。"
+                    ),
+                    "回",
+                    "回目",
+                    "賞金",
+                ),
+            }
+        }
+        (Paradox::Simpson { counts, adjusted }, lang) => {
+            let ratio = |(s, n): (u32, u32)| f64::from(s) / f64::from(n);
+            let rate = |c: (u32, u32)| format!("{}/{} ({})", c.0, c.1, pct(ratio(c)));
+            let total = |i: usize| (counts[i].0 + counts[i + 1].0, counts[i].1 + counts[i + 1].1);
+            let (a, b) = (total(0), total(2));
+            let d1 = ratio(counts[0]) - ratio(counts[2]);
+            let d2 = ratio(counts[1]) - ratio(counts[3]);
+            let crude = ratio(a) - ratio(b);
+            // A reversal: both groups favor one treatment, the totals the other.
+            let reversal = d1 * d2 > 0.0 && d1 * crude < 0.0;
+            let (better, worse) = if d1 > 0.0 { ("A", "B") } else { ("B", "A") };
+            // The hard group: the lower recovery rate over everyone in it.
+            let pooled = |g: usize| {
+                f64::from(counts[g].0 + counts[g + 2].0) / f64::from(counts[g].1 + counts[g + 2].1)
+            };
+            let hard = if pooled(1) < pooled(0) { 2 } else { 1 };
+            let share = |t: usize| {
+                f64::from(counts[t + hard - 1].1) / f64::from(counts[t].1 + counts[t + 1].1)
+            };
+            let (better_share, worse_share) = if better == "A" {
+                (share(0), share(2))
+            } else {
+                (share(2), share(0))
+            };
+            let kidney = *counts == [(81, 87), (192, 263), (234, 270), (55, 80)];
+            match lang {
+                Lang::En => t(
+                    format!(
+                        "Simpson's paradox ({} comparison)",
+                        if *adjusted { "adjusted" } else { "crude" }
+                    ),
+                    format!(
+                        "Treatment A cured {} of group 1 and {} of group 2; treatment B cured {} and {}. \
+                         Altogether A cured {} and B {}. Which treatment is better? One trial treats one patient \
+                         with each and scores 1 if only A's recovers, -1 if only B's, 0 otherwise.",
+                        rate(counts[0]),
+                        rate(counts[1]),
+                        rate(counts[2]),
+                        rate(counts[3]),
+                        rate(a),
+                        rate(b)
+                    ),
+                    if reversal {
+                        format!("{worse} cures more patients overall, so {worse} is better.")
+                    } else {
+                        "The overall rates tell which is better.".into()
+                    },
+                    if *adjusted {
+                        format!(
+                            "Compared within the same group, A minus B averages {p:+.4}: {}.",
+                            if p > 0.0 {
+                                "A is better"
+                            } else if p < 0.0 {
+                                "B is better"
+                            } else {
+                                "they are even"
+                            }
+                        )
+                    } else {
+                        format!(
+                            "Each patient drawn from their own arm, A minus B averages {p:+.4} ({}), the crude \
+                             difference. Try --adjusted.",
+                            paradox.exact().unwrap_or_default()
+                        )
+                    },
+                    if reversal {
+                        format!(
+                            "{better} is better in each group, but {} of its patients were in group {hard}, \
+                             where recovery is rarer for everyone, against {} of {worse}'s. Pooling mixes that \
+                             difference in case mix into the comparison; comparing within groups, or drawing both \
+                             patients from one group as --adjusted does, removes it.{}",
+                            pct(better_share),
+                            pct(worse_share),
+                            if kidney {
+                                " These are the kidney stone figures of Charig et al. (1986): group 1 small \
+                                 stones, group 2 large; A open surgery, B percutaneous nephrolithotomy."
+                            } else {
+                                ""
+                            }
+                        )
+                    } else {
+                        "When the groups get the treatments in different proportions, the pooled rates also \
+                         compare the groups, not only the treatments; --adjusted compares within the same group."
+                            .into()
+                    },
+                    "pairs",
+                    "Pair",
+                    "A minus B",
+                ),
+                Lang::Ja => t(
+                    format!(
+                        "シンプソンのパラドックス({})",
+                        if *adjusted { "グループをそろえた比較" } else { "全体での比較" }
+                    ),
+                    format!(
+                        "治療Aはグループ1で{}、グループ2で{}が回復し、治療Bは{}と{}でした。全体ではAが{}、Bが{}。\
+                         どちらの治療が良い? 1回の試行では各治療の患者を1人ずつ選び、Aの患者だけ回復なら1、\
+                         Bの患者だけなら-1、それ以外は0とします。",
+                        rate(counts[0]),
+                        rate(counts[1]),
+                        rate(counts[2]),
+                        rate(counts[3]),
+                        rate(a),
+                        rate(b)
+                    ),
+                    if reversal {
+                        format!("全体で多く治している{worse}のほうが良い。")
+                    } else {
+                        "全体の回復率を見ればどちらが良いかわかる。".into()
+                    },
+                    if *adjusted {
+                        format!(
+                            "同じグループの中で比べると、A - Bの平均は{p:+.4}: {}。",
+                            if p > 0.0 {
+                                "Aのほうが良い"
+                            } else if p < 0.0 {
+                                "Bのほうが良い"
+                            } else {
+                                "差はない"
+                            }
+                        )
+                    } else {
+                        format!(
+                            "それぞれの治療の患者から選ぶと、A - Bの平均は{p:+.4}({})で、全体での差です。\
+                             --adjustedも試してください。",
+                            paradox.exact().unwrap_or_default()
+                        )
+                    },
+                    if reversal {
+                        format!(
+                            "{better}はどちらのグループでも優れていますが、患者の{}が、誰にとっても回復しにくい\
+                             グループ{hard}でした({worse}は{})。全体で比べるとこの症例の違いが混ざり込みます。\
+                             グループごとに比べるか、--adjustedのように両方の患者を同じグループから選べば\
+                             取り除けます。{}",
+                            pct(better_share),
+                            pct(worse_share),
+                            if kidney {
+                                "この数値はCharigら(1986)の腎結石の研究で、グループ1が小さい結石、2が大きい結石、\
+                                 Aが開腹手術、Bが経皮的腎砕石術です。"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else {
+                        "グループごとに治療の割合が違うと、全体の回復率は治療だけでなくグループの違いも比べてしまいます。\
+                         --adjustedは同じグループの中で比べます。"
+                            .into()
+                    },
+                    "組",
+                    "組目",
+                    "A - B",
+                ),
+            }
+        }
+        (Paradox::Gambler { start, goal, win }, lang) => {
+            let fair = *win == 0.5;
+            match lang {
+                Lang::En => t(
+                    format!("Gambler's ruin ({start} to {goal}, each bet won {})", pct(*win)),
+                    format!(
+                        "You have {start} and bet 1 at a time, winning each bet with probability {}, until you \
+                         reach {goal} or lose everything. How likely are you to reach {goal}?",
+                        pct(*win)
+                    ),
+                    if fair {
+                        "With fair bets, it is a coin toss.".into()
+                    } else {
+                        format!(
+                            "{}, so about {}, the fair game's answer.",
+                            if (win - 0.5).abs() < 0.05 {
+                                format!("Each bet is almost fair ({} against {})", pct(*win), pct(1.0 - win))
+                            } else if *win < 0.5 {
+                                "The odds per bet are against you only a little".to_string()
+                            } else {
+                                "The odds per bet are in your favor, but only a little".to_string()
+                            },
+                            pct(f64::from(*start) / f64::from(*goal))
+                        )
+                    },
+                    format!("{} ({}).", pct(p), paradox.exact().unwrap_or_default()),
+                    if fair {
+                        format!(
+                            "A fair game keeps your expected money at {start}, so the chance of reaching {goal} \
+                             is {start}/{goal}: the further the goal, the likelier the ruin, even with fair bets."
+                        )
+                    } else if *win < 0.5 {
+                        "An edge against you compounds over the many bets a long game takes: with r = q/p, \
+                         reaching the goal has chance (1 - r^i) / (1 - r^N), which falls off quickly as the goal \
+                         moves away. Bet bigger and the game is shorter, and the edge has fewer bets to work."
+                            .into()
+                    } else {
+                        format!(
+                            "With the edge on your side the same formula, (1 - r^i) / (1 - r^N) with r = q/p, \
+                             works for you: however far the goal, the chance of reaching it stays above \
+                             1 - r^{start}, the chance of never going broke at all."
+                        )
+                    },
+                    "games",
+                    "Game",
+                    "reaching the goal",
+                ),
+                Lang::Ja => t(
+                    format!("ギャンブラーの破産({start}から{goal}へ、1回の勝率{})", pct(*win)),
+                    format!(
+                        "手持ち{start}で1ずつ賭け、各回の勝率は{}。{goal}に達するか、すべて失うまで続けます。\
+                         {goal}に届く確率は?",
+                        pct(*win)
+                    ),
+                    if fair {
+                        "公平な賭けなら五分五分。".into()
+                    } else {
+                        format!(
+                            "{}ので、公平な賭けと同じくだいたい{}。",
+                            if (win - 0.5).abs() < 0.05 {
+                                format!("1回ごとにはほぼ公平({}対{})な", pct(*win), pct(1.0 - win))
+                            } else if *win < 0.5 {
+                                "1回ごとの不利は少しだけな".to_string()
+                            } else {
+                                "1回ごとの有利は少しだけな".to_string()
+                            },
+                            pct(f64::from(*start) / f64::from(*goal))
+                        )
+                    },
+                    format!("{}({})。", pct(p), paradox.exact().unwrap_or_default()),
+                    if fair {
+                        format!(
+                            "公平な賭けでは手持ちの期待値が{start}のまま変わらないので、{goal}に届く確率は{start}/{goal}\
+                             です。目標が遠いほど、公平な賭けでも破産しやすくなります。"
+                        )
+                    } else if *win < 0.5 {
+                        "不利は、長いゲームの多くの賭けで積み重なります。r = q/pとして到達確率は\
+                         (1 - r^i) / (1 - r^N)で、目標が遠くなるほど急に下がります。1回の賭け金を大きくすると\
+                         ゲームが短くなり、不利が効く回数が減ります。"
+                            .into()
+                    } else {
+                        format!(
+                            "有利な賭けなら同じ式(r = q/pとして(1 - r^i) / (1 - r^N))があなたの味方です。目標が\
+                             どれほど遠くても、届く確率は一度も破産しない確率1 - r^{start}を下回りません。"
+                        )
+                    },
+                    "回",
+                    "回目",
+                    "目標に届く確率",
+                ),
+            }
+        }
     }
 }

@@ -124,6 +124,31 @@ fn all() -> Vec<Paradox> {
         Paradox::Bertrand {
             method: Chord::Midpoint,
         },
+        Paradox::StPetersburg { bank: 64 },
+        Paradox::StPetersburg { bank: 100 },
+        Paradox::Simpson {
+            counts: [(81, 87), (192, 263), (234, 270), (55, 80)],
+            adjusted: false,
+        },
+        Paradox::Simpson {
+            counts: [(81, 87), (192, 263), (234, 270), (55, 80)],
+            adjusted: true,
+        },
+        Paradox::Gambler {
+            start: 10,
+            goal: 20,
+            win: 18.0 / 37.0,
+        },
+        Paradox::Gambler {
+            start: 3,
+            goal: 10,
+            win: 0.5,
+        },
+        Paradox::Gambler {
+            start: 5,
+            goal: 8,
+            win: 0.7,
+        },
     ]
 }
 
@@ -421,4 +446,16 @@ fn sweep_values_stay_in_range_and_errors_name_the_value() {
     )
     .unwrap_err();
     assert_eq!(err, "at 2: bad");
+}
+
+#[test]
+fn only_whole_number_trials_are_tallied() {
+    let simpson = Paradox::Simpson {
+        counts: [(81, 87), (192, 263), (234, 270), (55, 80)],
+        adjusted: false,
+    };
+    assert!(simulate(&simpson, 1_000, 1, 10).distribution.is_none());
+    let st = Paradox::StPetersburg { bank: 64 };
+    let d = simulate(&st, 1_000, 1, 10).distribution.unwrap();
+    assert!(d.keys().all(|&k| k.is_power_of_two() && k <= 64));
 }

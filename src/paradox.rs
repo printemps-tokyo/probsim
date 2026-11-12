@@ -287,6 +287,76 @@ pub enum Paradox {
     Bertrand {
         method: Chord,
     },
+    /// Flip until heads; k flips pay 2^k, but never more than `bank`.
+    StPetersburg {
+        bank: u64,
+    },
+    /// Recoveries out of patients for treatment A and B in two groups:
+    /// `[(A1 successes, A1 patients), (A2 ..), (B1 ..), (B2 ..)]`. Each trial
+    /// is one patient on A minus one on B (1, 0 or -1). Crude: each from its
+    /// own arm's mix of groups; adjusted: both from one group drawn from the
+    /// pooled mix.
+    Simpson {
+        counts: [(u32, u32); 4],
+        adjusted: bool,
+    },
+    /// Bet one unit at a time from `start`, winning each bet with `win`,
+    /// until `goal` or ruin.
+    Gambler {
+        start: u32,
+        goal: u32,
+        win: f64,
+    },
+}
+
+/// The St. Petersburg game with a bank: K = floor(log2 bank), the largest
+/// number of flips whose prize 2^K the bank still pays in full.
+pub fn st_petersburg_k(bank: u64) -> u32 {
+    63 - bank.max(1).leading_zeros()
+}
+
+/// Gambler's ruin: the chance of reaching `goal` from `start` before 0,
+/// winning each unit bet with probability `p` (Feller, ch. XIV). Written
+/// with expm1 so it stays accurate and finite for long games and for p near
+/// 1/2: with r = q/p, (1 - r^i) / (1 - r^N), and i/N for a fair game.
+pub fn gambler_success(start: u32, goal: u32, p: f64) -> f64 {
+    let (i, n) = (f64::from(start), f64::from(goal));
+    let q = 1.0 - p;
+    if p == q {
+        return i / n;
+    }
+    let lr = (q / p).ln();
+    if lr > 0.0 {
+        // r > 1: r^(i-N) (1 - r^-i) / (1 - r^-N), all terms at most 1.
+        ((i - n) * lr).exp() * (-(-i * lr).exp_m1()) / (-(-n * lr).exp_m1())
+    } else {
+        (i * lr).exp_m1() / (n * lr).exp_m1()
+    }
+}
+
+/// The expected number of bets in gambler's ruin: i (N - i) for a fair game,
+/// (i - N P) / (q - p) otherwise, P the chance of reaching N. Near a fair
+/// game that difference cancels to nothing, so while N |ln(q/p)| is below
+/// 1e-3 the fair value is used: there the two differ by well under 0.1%.
+/// (Used to cost a run; the tests check it against the first-step equations.)
+pub fn gambler_duration(start: u32, goal: u32, p: f64) -> f64 {
+    let (i, n) = (f64::from(start), f64::from(goal));
+    let q = 1.0 - p;
+    let fair = i * (n - i);
+    if p == q || n * (q / p).ln().abs() < 1e-3 {
+        return fair;
+    }
+    let d = (i - n * gambler_success(start, goal, p)) / (q - p);
+    if d.is_finite() && d > 0.0 {
+        d
+    } else {
+        fair
+    }
+}
+
+/// Recovery rates of a Simpson table: (A1, A2, B1, B2).
+fn rates(counts: &[(u32, u32); 4]) -> [f64; 4] {
+    counts.map(|(s, n)| f64::from(s) / f64::from(n))
 }
 
 /// The story of one trial, for --explain: a buffer and its language.
@@ -346,6 +416,32 @@ impl Paradox {
             Paradox::Penney { .. } => "penney",
             Paradox::BoyGirl { .. } => "boy-girl",
             Paradox::Bertrand { .. } => "bertrand",
+            Paradox::StPetersburg { .. } => "st-petersburg",
+            Paradox::Simpson { .. } => "simpson",
+            Paradox::Gambler { .. } => "gambler",
+        }
+    }
+
+    /// Whether every trial is a whole number of at least 0, so the trials
+    /// can be tallied for quantiles (draws to complete, St. Petersburg prizes).
+    pub fn whole_trials(&self) -> bool {
+        matches!(
+            self,
+            Paradox::Coupon { budget: None, .. } | Paradox::StPetersburg { .. }
+        )
+    }
+
+    /// The fewest trials for which an interval is drawn and judged. For an
+    /// average that is `stats::MIN_FOR_MEAN`, except for the St. Petersburg
+    /// game: its largest prizes are so rare that, until the rarest one is
+    /// expected about 30 times (30 x 2^K games), the sample variance misses
+    /// them and the normal interval is wrong far more often than it says.
+    pub fn min_for_interval(&self) -> u64 {
+        match self {
+            Paradox::StPetersburg { bank } => {
+                30u64.saturating_mul(1u64 << st_petersburg_k(*bank).min(62))
+            }
+            _ => crate::stats::MIN_FOR_MEAN,
         }
     }
 
@@ -364,7 +460,9 @@ impl Paradox {
 
     pub fn measure(&self) -> Measure {
         match self {
-            Paradox::Coupon { budget: None, .. } => Measure::Mean,
+            Paradox::Coupon { budget: None, .. }
+            | Paradox::StPetersburg { .. }
+            | Paradox::Simpson { .. } => Measure::Mean,
             _ => Measure::Probability,
         }
     }
@@ -421,6 +519,27 @@ impl Paradox {
                 Chord::Radius => 0.5,
                 Chord::Midpoint => 0.25,
             },
+            Paradox::StPetersburg { bank } => {
+                // k = 1..K flips pay 2^k with chance 2^-k: 1 each. Every
+                // longer game pays the bank, together with chance 2^-K.
+                let k = st_petersburg_k(*bank);
+                f64::from(k) + *bank as f64 / 2f64.powi(k as i32)
+            }
+            Paradox::Simpson { counts, adjusted } => {
+                let [a1, a2, b1, b2] = rates(counts);
+                if *adjusted {
+                    let g1 = f64::from(counts[0].1 + counts[2].1);
+                    let g2 = f64::from(counts[1].1 + counts[3].1);
+                    (g1 * (a1 - b1) + g2 * (a2 - b2)) / (g1 + g2)
+                } else {
+                    let a =
+                        f64::from(counts[0].0 + counts[1].0) / f64::from(counts[0].1 + counts[1].1);
+                    let b =
+                        f64::from(counts[2].0 + counts[3].0) / f64::from(counts[2].1 + counts[3].1);
+                    a - b
+                }
+            }
+            Paradox::Gambler { start, goal, win } => gambler_success(*start, *goal, *win),
         }
     }
 
@@ -442,6 +561,33 @@ impl Paradox {
                 n * n * squares - exact::coupon_mean_equal(*items)
             }
             Paradox::Coupon { budget: None, .. } => f64::NAN,
+            Paradox::StPetersburg { bank } => {
+                // E[X^2] = sum_{k<=K} 4^k 2^-k + bank^2 2^-K.
+                let k = st_petersburg_k(*bank);
+                let two_k = 2f64.powi(k as i32);
+                let w = *bank as f64;
+                let second = 2.0 * two_k - 2.0 + w * w / two_k;
+                let mean = self.theory();
+                second - mean * mean
+            }
+            Paradox::Simpson { counts, adjusted } => {
+                // X = A - B in {-1, 0, 1}: E[X^2] = P(A != B).
+                let [a1, a2, b1, b2] = rates(counts);
+                let differ = |a: f64, b: f64| a * (1.0 - b) + b * (1.0 - a);
+                let second = if *adjusted {
+                    let g1 = f64::from(counts[0].1 + counts[2].1);
+                    let g2 = f64::from(counts[1].1 + counts[3].1);
+                    (g1 * differ(a1, b1) + g2 * differ(a2, b2)) / (g1 + g2)
+                } else {
+                    let a =
+                        f64::from(counts[0].0 + counts[1].0) / f64::from(counts[0].1 + counts[1].1);
+                    let b =
+                        f64::from(counts[2].0 + counts[3].0) / f64::from(counts[2].1 + counts[3].1);
+                    differ(a, b)
+                };
+                let mean = self.theory();
+                second - mean * mean
+            }
             _ => {
                 let p = self.theory();
                 p * (1.0 - p)
@@ -482,6 +628,29 @@ impl Paradox {
                 }
                 .to_string(),
             ),
+            Paradox::StPetersburg { bank } => {
+                let k = st_petersburg_k(*bank);
+                Some(format!("{k} + {bank}/2^{k}"))
+            }
+            Paradox::Simpson {
+                counts,
+                adjusted: false,
+            } => Some(format!(
+                "{}/{} - {}/{}",
+                counts[0].0 + counts[1].0,
+                counts[0].1 + counts[1].1,
+                counts[2].0 + counts[3].0,
+                counts[2].1 + counts[3].1
+            )),
+            Paradox::Gambler { start, goal, win } if *win == 0.5 => {
+                let g = gcd(u64::from(*start), u64::from(*goal)).max(1);
+                Some(format!(
+                    "{}/{}",
+                    u64::from(*start) / g,
+                    u64::from(*goal) / g
+                ))
+            }
+            Paradox::Gambler { .. } => Some("(1 - r^i) / (1 - r^N), r = q/p".to_string()),
             _ => None,
         }
     }
@@ -548,6 +717,26 @@ impl Paradox {
                 if *tuesday { "tuesday-boy" } else { "boy" }.to_string(),
             )],
             Paradox::Bertrand { method } => vec![("method", method.name().to_string())],
+            Paradox::StPetersburg { bank } => vec![("bank", bank.to_string())],
+            Paradox::Simpson { counts, adjusted } => vec![
+                (
+                    "counts",
+                    counts
+                        .iter()
+                        .map(|(s, n)| format!("{s}/{n}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                (
+                    "comparison",
+                    if *adjusted { "adjusted" } else { "crude" }.to_string(),
+                ),
+            ],
+            Paradox::Gambler { start, goal, win } => vec![
+                ("start", start.to_string()),
+                ("goal", goal.to_string()),
+                ("winProb", win.to_string()),
+            ],
         }
     }
 
@@ -988,6 +1177,139 @@ impl Paradox {
                     };
                 }
                 Some(if longer { 1.0 } else { 0.0 })
+            }
+            Paradox::StPetersburg { bank } => {
+                // Count the flips up to the first head. Past 63 flips the
+                // prize is beyond any bank this accepts (at most 2^53).
+                let mut flips = 1u32;
+                while rng.next_u64() & 1 == 0 {
+                    flips += 1;
+                }
+                let prize = if flips >= 63 {
+                    *bank
+                } else {
+                    (1u64 << flips).min(*bank)
+                };
+                if let Some((s, lang)) = story.as_mut() {
+                    let tails = flips - 1;
+                    let capped = flips >= 63 || (1u64 << flips) > *bank;
+                    let _ = match lang {
+                        Lang::En => write!(
+                            s,
+                            "{tails} tail{} then heads: {flips} flip{}, the prize is {}{}",
+                            if tails == 1 { "" } else { "s" },
+                            if flips == 1 { "" } else { "s" },
+                            crate::output::grouped(prize),
+                            if capped { " (the whole bank)" } else { "" }
+                        ),
+                        Lang::Ja => write!(
+                            s,
+                            "裏が{tails}回続いて表: {flips}回目で終わり、賞金{}{}",
+                            crate::output::grouped(prize),
+                            if capped {
+                                "(胴元の資金すべて)"
+                            } else {
+                                ""
+                            }
+                        ),
+                    };
+                }
+                Some(prize as f64)
+            }
+            Paradox::Simpson { counts, adjusted } => {
+                // Draw a group by the patients in it, then a recovery by the
+                // group's counts, with whole-number draws so the chances are
+                // exactly the table's.
+                let draw_group = |rng: &mut Rng, n1: u32, n2: u32| -> usize {
+                    usize::from(rng.below(u64::from(n1) + u64::from(n2)) >= u64::from(n1))
+                };
+                let recovers =
+                    |rng: &mut Rng, (s, n): (u32, u32)| rng.below(u64::from(n)) < u64::from(s);
+                let (ga, gb) = if *adjusted {
+                    let g = draw_group(rng, counts[0].1 + counts[2].1, counts[1].1 + counts[3].1);
+                    (g, g)
+                } else {
+                    (
+                        draw_group(rng, counts[0].1, counts[1].1),
+                        draw_group(rng, counts[2].1, counts[3].1),
+                    )
+                };
+                let a = recovers(rng, counts[ga]);
+                let b = recovers(rng, counts[2 + gb]);
+                let x = i32::from(a) - i32::from(b);
+                if let Some((s, lang)) = story.as_mut() {
+                    let lang = *lang;
+                    let word = |ok: bool| match (lang, ok) {
+                        (Lang::En, true) => "recovers",
+                        (Lang::En, false) => "does not recover",
+                        (Lang::Ja, true) => "回復",
+                        (Lang::Ja, false) => "回復せず",
+                    };
+                    let _ = match lang {
+                        Lang::En => write!(
+                            s,
+                            "A's patient (group {}) {}, B's patient (group {}) {}: {x:+}",
+                            ga + 1,
+                            word(a),
+                            gb + 1,
+                            word(b)
+                        ),
+                        Lang::Ja => write!(
+                            s,
+                            "Aの患者(グループ{})は{}、Bの患者(グループ{})は{}: {x:+}",
+                            ga + 1,
+                            word(a),
+                            gb + 1,
+                            word(b)
+                        ),
+                    };
+                }
+                Some(f64::from(x))
+            }
+            Paradox::Gambler { start, goal, win } => {
+                let mut money = *start;
+                let mut bets = 0u64;
+                let mut path = String::new();
+                while money > 0 && money < *goal {
+                    bets += 1;
+                    let won = rng.f64() < *win;
+                    if won {
+                        money += 1;
+                    } else {
+                        money -= 1;
+                    }
+                    if story.is_some() && bets <= 40 {
+                        path.push(if won { 'W' } else { 'L' });
+                    }
+                }
+                let reached = money == *goal;
+                if let Some((s, lang)) = story.as_mut() {
+                    let more = if bets > 40 { "..." } else { "" };
+                    let _ = match lang {
+                        Lang::En => write!(
+                            s,
+                            "{path}{more}: {} after {} bet{}",
+                            if reached {
+                                format!("reached {goal}")
+                            } else {
+                                "ruined".to_string()
+                            },
+                            crate::output::grouped(bets),
+                            if bets == 1 { "" } else { "s" }
+                        ),
+                        Lang::Ja => write!(
+                            s,
+                            "{path}{more}: {}回賭けて{}",
+                            crate::output::grouped(bets),
+                            if reached {
+                                format!("{goal}に到達")
+                            } else {
+                                "破産".to_string()
+                            }
+                        ),
+                    };
+                }
+                Some(if reached { 1.0 } else { 0.0 })
             }
         }
     }

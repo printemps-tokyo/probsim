@@ -17,7 +17,7 @@ fn band_with(o: &Outcome, sd: f64, n: u64) -> Option<(f64, f64)> {
     let nf = n as f64;
     let holds = match o.paradox.measure() {
         Measure::Probability => nf * o.theory >= 5.0 && nf * (1.0 - o.theory) >= 5.0,
-        Measure::Mean => n >= MIN_FOR_MEAN,
+        Measure::Mean => n >= o.paradox.min_for_interval().max(MIN_FOR_MEAN),
     };
     (holds && sd.is_finite() && sd > 0.0).then(|| {
         let h = Z95 * sd / nf.sqrt();
